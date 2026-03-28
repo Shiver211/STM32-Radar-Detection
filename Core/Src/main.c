@@ -107,6 +107,11 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    {
+      const char msg[] = "helloworld\r\n";
+      HAL_UART_Transmit(&huart1, (uint8_t *)msg, sizeof(msg) - 1, HAL_MAX_DELAY);
+      HAL_Delay(1000);
+    }
   }
   /* USER CODE END 3 */
 }
