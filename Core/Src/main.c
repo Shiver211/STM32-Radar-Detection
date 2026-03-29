@@ -704,7 +704,7 @@ static LD6002_RangeState LD6002_ClassifyRangeState(float raw_range_cm,
 /*
  * 处理 0x0A16 距离帧：
  * - flag=1：有效距离，更新滤波和分类；
- * - flag=0：视为无人证据，并清理距离有效状态。
+ * - flag!=1：仅清理距离有效状态，不影响人体存在状态。
  */
 static void LD6002_UpdateTargetRange(uint32_t flag, float range_cm)
 {
@@ -713,11 +713,6 @@ static void LD6002_UpdateTargetRange(uint32_t flag, float range_cm)
 
   if (flag != 1U)
   {
-    if (flag == 0U)
-    {
-      LD6002_UpdateHumanPresence(false);
-    }
-
     if (s_target_range_valid || (s_range_state != LD6002_RANGE_UNKNOWN))
     {
       s_target_range_valid = false;
@@ -730,8 +725,6 @@ static void LD6002_UpdateTargetRange(uint32_t flag, float range_cm)
 
     return;
   }
-
-  LD6002_UpdateHumanPresence(true);
 
   if (range_cm < 0.0f)
   {
