@@ -21,16 +21,54 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <stdbool.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
 
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+typedef enum
+{
+  LD6002_WAIT_SOF = 0,
+  LD6002_ID_HIGH,
+  LD6002_ID_LOW,
+  LD6002_LEN_HIGH,
+  LD6002_LEN_LOW,
+  LD6002_TYPE_HIGH,
+  LD6002_TYPE_LOW,
+  LD6002_HEAD_CKSUM,
+  LD6002_DATA,
+  LD6002_DATA_CKSUM
+} LD6002_ParseState;
+
+typedef struct
+{
+  uint16_t id;
+  uint16_t len;
+  uint16_t type;
+  uint8_t data[128];
+} LD6002_Frame;
+
+typedef struct
+{
+  LD6002_ParseState state;
+  uint8_t header[7];
+  uint8_t header_idx;
+  uint16_t data_idx;
+  LD6002_Frame frame;
+} LD6002_Parser;
 
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define LD6002_SOF 0x01U
+#define LD6002_MAX_PAYLOAD_LEN 128U
+#define LD6002_FRAME_QUEUE_SIZE 8U
+#define LD6002_UART_TIMEOUT_MS 50U
 
 /* USER CODE END PD */
 
@@ -46,6 +84,20 @@ UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
+static uint8_t s_uart2_rx_byte;
+static LD6002_Parser s_ld6002_parser;
+static LD6002_Frame s_frame_queue[LD6002_FRAME_QUEUE_SIZE];
+static volatile uint8_t s_frame_head;
+static volatile uint8_t s_frame_tail;
+static volatile uint32_t s_frame_dropped;
+static volatile uint32_t s_cksum_error;
+static volatile uint32_t s_len_error;
+static volatile uint32_t s_sof_skip;
+static uint32_t s_last_stats_tick;
+static uint32_t s_last_dropped_report;
+static uint32_t s_last_cksum_report;
+static uint32_t s_last_len_report;
+static uint32_t s_last_sof_report;
 
 /* USER CODE END PV */
 
@@ -56,11 +108,377 @@ static void MX_I2C1_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_USART2_UART_Init(void);
 /* USER CODE BEGIN PFP */
+static void LD6002_ParserReset(LD6002_Parser *parser);
+static uint8_t LD6002_Checksum(const uint8_t *data, uint16_t len);
+static bool LD6002_ConsumeByte(LD6002_Parser *parser, uint8_t byte, LD6002_Frame *out_frame);
+static void LD6002_QueuePushFromISR(const LD6002_Frame *frame);
+static bool LD6002_QueuePop(LD6002_Frame *frame);
+static void LD6002_StartUart2Rx(void);
+static uint32_t LD6002_U32Le(const uint8_t *buf);
+static float LD6002_F32Le(const uint8_t *buf);
+static void LD6002_FormatFloat(float value, char *out, size_t out_size);
+static void UART1_SendText(const char *text);
+static void UART1_Sendf(const char *fmt, ...);
+static void LD6002_LogFrame(const LD6002_Frame *frame);
+static void LD6002_ProcessFrames(void);
+static void LD6002_ReportStats(void);
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static void LD6002_ParserReset(LD6002_Parser *parser)
+{
+  parser->state = LD6002_WAIT_SOF;
+  parser->header_idx = 0U;
+  parser->data_idx = 0U;
+  parser->frame.id = 0U;
+  parser->frame.len = 0U;
+  parser->frame.type = 0U;
+}
+
+static uint8_t LD6002_Checksum(const uint8_t *data, uint16_t len)
+{
+  uint8_t cksum = 0U;
+  uint16_t i;
+
+  for (i = 0U; i < len; i++)
+  {
+    cksum ^= data[i];
+  }
+
+  return (uint8_t)(~cksum);
+}
+
+static bool LD6002_ConsumeByte(LD6002_Parser *parser, uint8_t byte, LD6002_Frame *out_frame)
+{
+  uint8_t expected_cksum;
+
+  switch (parser->state)
+  {
+  case LD6002_WAIT_SOF:
+    if (byte == LD6002_SOF)
+    {
+      parser->header_idx = 0U;
+      parser->data_idx = 0U;
+      parser->header[parser->header_idx++] = byte;
+      parser->frame.id = 0U;
+      parser->frame.len = 0U;
+      parser->frame.type = 0U;
+      parser->state = LD6002_ID_HIGH;
+    }
+    else
+    {
+      s_sof_skip++;
+    }
+    break;
+
+  case LD6002_ID_HIGH:
+    parser->frame.id = ((uint16_t)byte << 8);
+    parser->header[parser->header_idx++] = byte;
+    parser->state = LD6002_ID_LOW;
+    break;
+
+  case LD6002_ID_LOW:
+    parser->frame.id |= byte;
+    parser->header[parser->header_idx++] = byte;
+    parser->state = LD6002_LEN_HIGH;
+    break;
+
+  case LD6002_LEN_HIGH:
+    parser->frame.len = ((uint16_t)byte << 8);
+    parser->header[parser->header_idx++] = byte;
+    parser->state = LD6002_LEN_LOW;
+    break;
+
+  case LD6002_LEN_LOW:
+    parser->frame.len |= byte;
+    parser->header[parser->header_idx++] = byte;
+    if (parser->frame.len > LD6002_MAX_PAYLOAD_LEN)
+    {
+      s_len_error++;
+      LD6002_ParserReset(parser);
+    }
+    else
+    {
+      parser->state = LD6002_TYPE_HIGH;
+    }
+    break;
+
+  case LD6002_TYPE_HIGH:
+    parser->frame.type = ((uint16_t)byte << 8);
+    parser->header[parser->header_idx++] = byte;
+    parser->state = LD6002_TYPE_LOW;
+    break;
+
+  case LD6002_TYPE_LOW:
+    parser->frame.type |= byte;
+    parser->header[parser->header_idx++] = byte;
+    parser->state = LD6002_HEAD_CKSUM;
+    break;
+
+  case LD6002_HEAD_CKSUM:
+    expected_cksum = LD6002_Checksum(parser->header, (uint16_t)sizeof(parser->header));
+    if (byte != expected_cksum)
+    {
+      s_cksum_error++;
+      LD6002_ParserReset(parser);
+      break;
+    }
+
+    if (parser->frame.len == 0U)
+    {
+      parser->state = LD6002_DATA_CKSUM;
+    }
+    else
+    {
+      parser->data_idx = 0U;
+      parser->state = LD6002_DATA;
+    }
+    break;
+
+  case LD6002_DATA:
+    parser->frame.data[parser->data_idx++] = byte;
+    if (parser->data_idx >= parser->frame.len)
+    {
+      parser->state = LD6002_DATA_CKSUM;
+    }
+    break;
+
+  case LD6002_DATA_CKSUM:
+    expected_cksum = LD6002_Checksum(parser->frame.data, parser->frame.len);
+    if (byte == expected_cksum)
+    {
+      *out_frame = parser->frame;
+      LD6002_ParserReset(parser);
+      return true;
+    }
+
+    s_cksum_error++;
+    LD6002_ParserReset(parser);
+    break;
+
+  default:
+    LD6002_ParserReset(parser);
+    break;
+  }
+
+  return false;
+}
+
+static void LD6002_QueuePushFromISR(const LD6002_Frame *frame)
+{
+  uint8_t next_head = (uint8_t)((s_frame_head + 1U) % LD6002_FRAME_QUEUE_SIZE);
+
+  if (next_head == s_frame_tail)
+  {
+    s_frame_dropped++;
+    return;
+  }
+
+  s_frame_queue[s_frame_head] = *frame;
+  s_frame_head = next_head;
+}
+
+static bool LD6002_QueuePop(LD6002_Frame *frame)
+{
+  if (s_frame_tail == s_frame_head)
+  {
+    return false;
+  }
+
+  *frame = s_frame_queue[s_frame_tail];
+  s_frame_tail = (uint8_t)((s_frame_tail + 1U) % LD6002_FRAME_QUEUE_SIZE);
+  return true;
+}
+
+static void LD6002_StartUart2Rx(void)
+{
+  if (HAL_UART_Receive_IT(&huart2, &s_uart2_rx_byte, 1U) != HAL_OK)
+  {
+    UART1_SendText("[RADAR] UART2 RX start failed\r\n");
+  }
+}
+
+static uint32_t LD6002_U32Le(const uint8_t *buf)
+{
+  return ((uint32_t)buf[0]) |
+         ((uint32_t)buf[1] << 8) |
+         ((uint32_t)buf[2] << 16) |
+         ((uint32_t)buf[3] << 24);
+}
+
+static float LD6002_F32Le(const uint8_t *buf)
+{
+  uint32_t raw = LD6002_U32Le(buf);
+  float value;
+  memcpy(&value, &raw, sizeof(value));
+  return value;
+}
+
+static void LD6002_FormatFloat(float value, char *out, size_t out_size)
+{
+  int32_t scaled = (int32_t)(value * 1000.0f);
+  int32_t abs_scaled = (scaled < 0) ? -scaled : scaled;
+  int32_t integer = abs_scaled / 1000;
+  int32_t decimal = abs_scaled % 1000;
+
+  if (scaled < 0)
+  {
+    (void)snprintf(out, out_size, "-%ld.%03ld", (long)integer, (long)decimal);
+  }
+  else
+  {
+    (void)snprintf(out, out_size, "%ld.%03ld", (long)integer, (long)decimal);
+  }
+}
+
+static void UART1_SendText(const char *text)
+{
+  size_t len = strlen(text);
+  if (len > 0U)
+  {
+    (void)HAL_UART_Transmit(&huart1, (uint8_t *)text, (uint16_t)len, LD6002_UART_TIMEOUT_MS);
+  }
+}
+
+static void UART1_Sendf(const char *fmt, ...)
+{
+  char tx_buf[192];
+  va_list args;
+  int written;
+
+  va_start(args, fmt);
+  written = vsnprintf(tx_buf, sizeof(tx_buf), fmt, args);
+  va_end(args);
+
+  if (written > 0)
+  {
+    uint16_t tx_len = (written >= (int)sizeof(tx_buf)) ? ((uint16_t)sizeof(tx_buf) - 1U) : (uint16_t)written;
+    (void)HAL_UART_Transmit(&huart1, (uint8_t *)tx_buf, tx_len, LD6002_UART_TIMEOUT_MS);
+  }
+}
+
+static void LD6002_LogFrame(const LD6002_Frame *frame)
+{
+  char a[20];
+  char b[20];
+  char c[20];
+  uint16_t i;
+  char hex_buf[96];
+  int pos = 0;
+
+  switch (frame->type)
+  {
+  case 0x0F09:
+    if (frame->len >= 2U)
+    {
+      uint16_t is_human = (uint16_t)frame->data[0] | ((uint16_t)frame->data[1] << 8);
+      UART1_Sendf("[RADAR] TYPE=0x0F09 ID=0x%04X Human=%u\r\n", frame->id, (unsigned)is_human);
+    }
+    break;
+
+  case 0x0A13:
+    if (frame->len >= 12U)
+    {
+      float total_phase = LD6002_F32Le(&frame->data[0]);
+      float breath_phase = LD6002_F32Le(&frame->data[4]);
+      float heart_phase = LD6002_F32Le(&frame->data[8]);
+      LD6002_FormatFloat(total_phase, a, sizeof(a));
+      LD6002_FormatFloat(breath_phase, b, sizeof(b));
+      LD6002_FormatFloat(heart_phase, c, sizeof(c));
+      UART1_Sendf("[RADAR] TYPE=0x0A13 ID=0x%04X Total=%s Breath=%s Heart=%s\r\n", frame->id, a, b, c);
+    }
+    else
+    {
+      UART1_Sendf("[RADAR] TYPE=0x0A13 LEN_ERR len=%u\r\n", frame->len);
+    }
+    break;
+
+  case 0x0A14:
+    if (frame->len >= 4U)
+    {
+      float breath_rate = LD6002_F32Le(&frame->data[0]);
+      LD6002_FormatFloat(breath_rate, a, sizeof(a));
+      UART1_Sendf("[RADAR] TYPE=0x0A14 ID=0x%04X BreathRate=%s bpm\r\n", frame->id, a);
+    }
+    break;
+
+  case 0x0A15:
+    if (frame->len >= 4U)
+    {
+      float heart_rate = LD6002_F32Le(&frame->data[0]);
+      LD6002_FormatFloat(heart_rate, a, sizeof(a));
+      UART1_Sendf("[RADAR] TYPE=0x0A15 ID=0x%04X HeartRate=%s bpm\r\n", frame->id, a);
+    }
+    break;
+
+  case 0x0A16:
+    if (frame->len >= 8U)
+    {
+      uint32_t flag = LD6002_U32Le(&frame->data[0]);
+      float range = LD6002_F32Le(&frame->data[4]);
+      LD6002_FormatFloat(range, a, sizeof(a));
+      UART1_Sendf("[RADAR] TYPE=0x0A16 ID=0x%04X Flag=%lu Range=%s cm\r\n", frame->id, (unsigned long)flag, a);
+    }
+    break;
+
+  default:
+    for (i = 0U; (i < frame->len) && (i < 20U); i++)
+    {
+      pos += snprintf(&hex_buf[pos], sizeof(hex_buf) - (size_t)pos, "%02X ", frame->data[i]);
+      if (pos >= (int)(sizeof(hex_buf) - 4U))
+      {
+        break;
+      }
+    }
+    UART1_Sendf("[RADAR] TYPE=0x%04X ID=0x%04X LEN=%u DATA=%s\r\n",
+                frame->type,
+                frame->id,
+                frame->len,
+                (pos > 0) ? hex_buf : "");
+    break;
+  }
+}
+
+static void LD6002_ProcessFrames(void)
+{
+  LD6002_Frame frame;
+
+  while (LD6002_QueuePop(&frame))
+  {
+    LD6002_LogFrame(&frame);
+  }
+}
+
+static void LD6002_ReportStats(void)
+{
+  uint32_t now = HAL_GetTick();
+
+  if ((now - s_last_stats_tick) < 1000U)
+  {
+    return;
+  }
+
+  s_last_stats_tick = now;
+
+  if ((s_frame_dropped != s_last_dropped_report) ||
+      (s_cksum_error != s_last_cksum_report) ||
+      (s_len_error != s_last_len_report) ||
+      (s_sof_skip != s_last_sof_report))
+  {
+    UART1_Sendf("[RADAR][STAT] drop=%lu cksum=%lu len=%lu sof_skip=%lu\r\n",
+                (unsigned long)s_frame_dropped,
+                (unsigned long)s_cksum_error,
+                (unsigned long)s_len_error,
+                (unsigned long)s_sof_skip);
+
+    s_last_dropped_report = s_frame_dropped;
+    s_last_cksum_report = s_cksum_error;
+    s_last_len_report = s_len_error;
+    s_last_sof_report = s_sof_skip;
+  }
+}
 
 /* USER CODE END 0 */
 
@@ -97,6 +515,9 @@ int main(void)
   MX_USART1_UART_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
+  LD6002_ParserReset(&s_ld6002_parser);
+  LD6002_StartUart2Rx();
+  UART1_SendText("\r\n[RADAR] UART2->TF parser started\r\n");
 
   /* USER CODE END 2 */
 
@@ -107,11 +528,8 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    {
-      const char msg[] = "helloworld\r\n";
-      HAL_UART_Transmit(&huart1, (uint8_t *)msg, sizeof(msg) - 1, HAL_MAX_DELAY);
-      HAL_Delay(1000);
-    }
+    LD6002_ProcessFrames();
+    LD6002_ReportStats();
   }
   /* USER CODE END 3 */
 }
@@ -284,6 +702,28 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  LD6002_Frame frame;
+
+  if (huart->Instance == USART2)
+  {
+    if (LD6002_ConsumeByte(&s_ld6002_parser, s_uart2_rx_byte, &frame))
+    {
+      LD6002_QueuePushFromISR(&frame);
+    }
+
+    (void)HAL_UART_Receive_IT(&huart2, &s_uart2_rx_byte, 1U);
+  }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART2)
+  {
+    (void)HAL_UART_Receive_IT(&huart2, &s_uart2_rx_byte, 1U);
+  }
+}
 
 /* USER CODE END 4 */
 
