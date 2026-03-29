@@ -73,6 +73,20 @@ typedef enum
   OLED_PANEL_MODE_COUNT
 } OLED_RightPanelMode;
 
+typedef enum
+{
+  LD6002_RANGE_UNKNOWN = 0,
+  LD6002_RANGE_NORMAL,
+  LD6002_RANGE_TOO_NEAR,
+  LD6002_RANGE_TOO_FAR
+} LD6002_RangeState;
+
+typedef enum
+{
+  OLED_WAVE_MODE_NORMAL = 0,
+  OLED_WAVE_MODE_AXES_ONLY
+} OLED_WaveMode;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -82,8 +96,14 @@ typedef enum
 #define LD6002_FRAME_QUEUE_SIZE 16U
 #define LD6002_UART_TIMEOUT_MS 50U
 #define LD6002_NO_DATA_TIMEOUT_MS 1000U
-#define LD6002_TARGET_RANGE_MIN_CM 25.0f
+#define LD6002_HUMAN_ENTER_CONFIRM_FRAMES 2U
+#define LD6002_HUMAN_LEAVE_CONFIRM_FRAMES 1U
+
+#define LD6002_TARGET_RANGE_MIN_CM 35.0f
 #define LD6002_TARGET_RANGE_MAX_CM 100.0f
+#define LD6002_TARGET_RANGE_NEAR_RELEASE_CM 36.0f
+#define LD6002_TARGET_RANGE_FAR_RELEASE_CM 99.0f
+#define LD6002_RANGE_FILTER_ALPHA 0.75f
 
 #define OLED_WAVE_X_START 0U
 #define OLED_WAVE_X_END   95U
@@ -100,8 +120,8 @@ typedef enum
 #define OLED_TEXT_3CHAR_X (OLED_VALUE_AREA_X_START + ((OLED_VALUE_AREA_WIDTH - 24U) / 2U))
 #define OLED_TEXT_4CHAR_X (OLED_VALUE_AREA_X_START + ((OLED_VALUE_AREA_WIDTH - 32U) / 2U))
 
-#define OLED_TEXT_LINE1_Y 2U
-#define OLED_TEXT_LINE2_Y 5U
+#define OLED_TEXT_LINE1_Y 5U
+#define OLED_TEXT_LINE2_Y 6U
 
 #define OLED_ZH_XIN 0U
 #define OLED_ZH_LV  1U
@@ -171,11 +191,18 @@ static uint32_t s_last_oled_wave_tick;
 static uint32_t s_last_oled_text_tick;
 static uint32_t s_last_radar_frame_tick;
 static bool s_radar_data_online;
+
 static bool s_human_detect_valid;
 static bool s_human_present;
+static bool s_human_candidate_present;
+static uint8_t s_human_candidate_count;
+
 static bool s_target_range_valid;
 static float s_target_range_cm;
-static bool s_oled_axes_only_mode;
+static float s_target_range_filtered_cm;
+static LD6002_RangeState s_range_state;
+
+static OLED_WaveMode s_oled_wave_mode;
 static OLED_RightPanelMode s_oled_panel_drawn_mode;
 
 /* USER CODE END PV */
@@ -196,6 +223,11 @@ static void LD6002_StartUart2Rx(void);
 static uint32_t LD6002_U32Le(const uint8_t *buf);
 static float LD6002_F32Le(const uint8_t *buf);
 static void LD6002_FormatFloat(float value, char *out, size_t out_size);
+static void LD6002_UpdateHumanPresence(bool raw_human_present);
+static LD6002_RangeState LD6002_ClassifyRangeState(float raw_range_cm,
+                                                    LD6002_RangeState prev_state);
+static void LD6002_UpdateTargetRange(uint32_t flag, float range_cm);
+
 static void UART1_SendText(const char *text);
 static void UART1_Sendf(const char *fmt, ...);
 static void LD6002_LogFrame(const LD6002_Frame *frame);
@@ -205,8 +237,8 @@ static uint8_t OLED_MapPhaseToY(float value, uint8_t center_y, float gain, uint8
 static void OLED_DrawLine(uint8_t x0, uint8_t y0, uint8_t x1, uint8_t y1);
 static void OLED_DrawWaveAxes(void);
 static void OLED_ClearWaveAndKeepAxes(void);
-static bool OLED_ShouldAxesOnly(void);
 static OLED_RightPanelMode OLED_GetPanelMode(void);
+static OLED_WaveMode OLED_GetWaveMode(void);
 static void OLED_DrawPanelMode(OLED_RightPanelMode mode);
 static void OLED_PlotWaveColumn(float breath_phase, float heart_phase);
 static void OLED_UpdateVitalsText(void);
@@ -426,6 +458,113 @@ static void LD6002_FormatFloat(float value, char *out, size_t out_size)
   }
 }
 
+static void LD6002_UpdateHumanPresence(bool raw_human_present)
+{
+  uint8_t required_frames = raw_human_present ? LD6002_HUMAN_ENTER_CONFIRM_FRAMES : LD6002_HUMAN_LEAVE_CONFIRM_FRAMES;
+
+  if ((!s_human_detect_valid) || (s_human_candidate_present != raw_human_present))
+  {
+    s_human_candidate_present = raw_human_present;
+    s_human_candidate_count = 1U;
+  }
+  else if (s_human_candidate_count < 0xFFU)
+  {
+    s_human_candidate_count++;
+  }
+
+  if (s_human_candidate_count >= required_frames)
+  {
+    if ((!s_human_detect_valid) || (s_human_present != raw_human_present))
+    {
+      s_oled_rate_dirty = true;
+    }
+
+    s_human_detect_valid = true;
+    s_human_present = raw_human_present;
+  }
+}
+
+static LD6002_RangeState LD6002_ClassifyRangeState(float raw_range_cm,
+                                                    LD6002_RangeState prev_state)
+{
+  if (raw_range_cm < LD6002_TARGET_RANGE_MIN_CM)
+  {
+    return LD6002_RANGE_TOO_NEAR;
+  }
+
+  if (raw_range_cm > LD6002_TARGET_RANGE_MAX_CM)
+  {
+    return LD6002_RANGE_TOO_FAR;
+  }
+
+  switch (prev_state)
+  {
+  case LD6002_RANGE_TOO_NEAR:
+    return (raw_range_cm < LD6002_TARGET_RANGE_NEAR_RELEASE_CM) ? LD6002_RANGE_TOO_NEAR : LD6002_RANGE_NORMAL;
+
+  case LD6002_RANGE_TOO_FAR:
+    return (raw_range_cm > LD6002_TARGET_RANGE_FAR_RELEASE_CM) ? LD6002_RANGE_TOO_FAR : LD6002_RANGE_NORMAL;
+
+  default:
+    return LD6002_RANGE_NORMAL;
+  }
+}
+
+static void LD6002_UpdateTargetRange(uint32_t flag, float range_cm)
+{
+  LD6002_RangeState prev_state;
+  LD6002_RangeState next_state;
+
+  if (flag != 1U)
+  {
+    if (flag == 0U)
+    {
+      LD6002_UpdateHumanPresence(false);
+    }
+
+    if (s_target_range_valid || (s_range_state != LD6002_RANGE_UNKNOWN))
+    {
+      s_target_range_valid = false;
+      s_target_range_cm = 0.0f;
+      s_target_range_filtered_cm = 0.0f;
+      s_range_state = LD6002_RANGE_UNKNOWN;
+      s_oled_rate_dirty = true;
+    }
+
+    return;
+  }
+
+  LD6002_UpdateHumanPresence(true);
+
+  if (range_cm < 0.0f)
+  {
+    range_cm = 0.0f;
+  }
+
+  prev_state = s_range_state;
+
+  if (!s_target_range_valid)
+  {
+    s_target_range_filtered_cm = range_cm;
+  }
+  else
+  {
+    s_target_range_filtered_cm = (LD6002_RANGE_FILTER_ALPHA * range_cm) +
+                                 ((1.0f - LD6002_RANGE_FILTER_ALPHA) * s_target_range_filtered_cm);
+  }
+
+  next_state = LD6002_ClassifyRangeState(range_cm, prev_state);
+
+  if ((!s_target_range_valid) || (next_state != prev_state))
+  {
+    s_oled_rate_dirty = true;
+  }
+
+  s_target_range_cm = range_cm;
+  s_target_range_valid = true;
+  s_range_state = next_state;
+}
+
 static uint8_t OLED_MapPhaseToY(float value, uint8_t center_y, float gain, uint8_t y_min, uint8_t y_max)
 {
   int32_t y = (int32_t)center_y - (int32_t)(value * gain);
@@ -511,21 +650,6 @@ static void OLED_ClearWaveAndKeepAxes(void)
   OLED_RefreshDirty();
 }
 
-static bool OLED_ShouldAxesOnly(void)
-{
-  if (!s_radar_data_online)
-  {
-    return true;
-  }
-
-  if (s_human_detect_valid && !s_human_present)
-  {
-    return true;
-  }
-
-  return false;
-}
-
 static OLED_RightPanelMode OLED_GetPanelMode(void)
 {
   if (!s_radar_data_online)
@@ -540,18 +664,33 @@ static OLED_RightPanelMode OLED_GetPanelMode(void)
 
   if (s_target_range_valid)
   {
-    if (s_target_range_cm > LD6002_TARGET_RANGE_MAX_CM)
+    if (s_range_state == LD6002_RANGE_TOO_FAR)
     {
       return OLED_PANEL_DIST_TOO_FAR;
     }
 
-    if (s_target_range_cm < LD6002_TARGET_RANGE_MIN_CM)
+    if (s_range_state == LD6002_RANGE_TOO_NEAR)
     {
       return OLED_PANEL_DIST_TOO_NEAR;
     }
   }
 
   return OLED_PANEL_VITALS;
+}
+
+static OLED_WaveMode OLED_GetWaveMode(void)
+{
+  OLED_RightPanelMode panel_mode = OLED_GetPanelMode();
+
+  if ((panel_mode == OLED_PANEL_NO_DATA) ||
+      (panel_mode == OLED_PANEL_NO_HUMAN) ||
+      (panel_mode == OLED_PANEL_DIST_TOO_FAR) ||
+      (panel_mode == OLED_PANEL_DIST_TOO_NEAR))
+  {
+    return OLED_WAVE_MODE_AXES_ONLY;
+  }
+
+  return OLED_WAVE_MODE_NORMAL;
 }
 
 static void OLED_DrawPanelMode(OLED_RightPanelMode mode)
@@ -568,23 +707,29 @@ static void OLED_DrawPanelMode(OLED_RightPanelMode mode)
     break;
 
   case OLED_PANEL_NO_DATA:
+    OLED_ShowCHinese(OLED_VALUE_LABEL_X, 1U, OLED_ZH_CUO); /* 错 */
+    OLED_ShowCHinese((u8)(OLED_VALUE_LABEL_X + 16U), 1U, OLED_ZH_WU2); /* 误 */
     OLED_ShowString(OLED_TEXT_2CHAR_X, OLED_TEXT_LINE1_Y, (u8 *)"No", 8U);
     OLED_ShowString(OLED_TEXT_4CHAR_X, OLED_TEXT_LINE2_Y, (u8 *)"Data", 8U);
     break;
 
   case OLED_PANEL_NO_HUMAN:
-    OLED_ShowCHinese(OLED_VALUE_LABEL_X, 0U, OLED_ZH_CUO); /* 错 */
-    OLED_ShowCHinese((u8)(OLED_VALUE_LABEL_X + 16U), 0U, OLED_ZH_WU2); /* 误 */
-    OLED_ShowCHinese(OLED_VALUE_LABEL_X, 4U, OLED_ZH_WU); /* 无 */
-    OLED_ShowCHinese((u8)(OLED_VALUE_LABEL_X + 16U), 4U, OLED_ZH_REN); /* 人 */
+    OLED_ShowCHinese(OLED_VALUE_LABEL_X, 1U, OLED_ZH_CUO); /* 错 */
+    OLED_ShowCHinese((u8)(OLED_VALUE_LABEL_X + 16U), 1U, OLED_ZH_WU2); /* 误 */
+    OLED_ShowCHinese(OLED_VALUE_LABEL_X, 5U, OLED_ZH_WU); /* 无 */
+    OLED_ShowCHinese((u8)(OLED_VALUE_LABEL_X + 16U), 5U, OLED_ZH_REN); /* 人 */
     break;
 
   case OLED_PANEL_DIST_TOO_FAR:
+    OLED_ShowCHinese(OLED_VALUE_LABEL_X, 1U, OLED_ZH_CUO); /* 错 */
+    OLED_ShowCHinese((u8)(OLED_VALUE_LABEL_X + 16U), 1U, OLED_ZH_WU2); /* 误 */
     OLED_ShowString(OLED_TEXT_3CHAR_X, OLED_TEXT_LINE1_Y, (u8 *)"Too", 8U);
     OLED_ShowString(OLED_TEXT_3CHAR_X, OLED_TEXT_LINE2_Y, (u8 *)"Far", 8U);
     break;
 
   case OLED_PANEL_DIST_TOO_NEAR:
+    OLED_ShowCHinese(OLED_VALUE_LABEL_X, 1U, OLED_ZH_CUO); /* 错 */
+    OLED_ShowCHinese((u8)(OLED_VALUE_LABEL_X + 16U), 1U, OLED_ZH_WU2); /* 误 */
     OLED_ShowString(OLED_TEXT_3CHAR_X, OLED_TEXT_LINE1_Y, (u8 *)"Too", 8U);
     OLED_ShowString(OLED_TEXT_4CHAR_X, OLED_TEXT_LINE2_Y, (u8 *)"Near", 8U);
     break;
@@ -725,7 +870,7 @@ static void OLED_SetPhases(float breath_phase, float heart_phase)
 static void OLED_Service(void)
 {
   uint32_t now;
-  bool should_axes_only;
+  OLED_WaveMode target_wave_mode;
 
   if (!s_oled_ready)
   {
@@ -738,26 +883,21 @@ static void OLED_Service(void)
   {
     s_radar_data_online = false;
     s_human_detect_valid = false;
+    s_human_candidate_count = 0U;
     s_target_range_valid = false;
+    s_range_state = LD6002_RANGE_UNKNOWN;
     s_oled_rate_dirty = true;
   }
 
-  should_axes_only = OLED_ShouldAxesOnly();
-  if (should_axes_only && !s_oled_axes_only_mode)
+  target_wave_mode = OLED_GetWaveMode();
+  if (target_wave_mode != s_oled_wave_mode)
   {
-    s_oled_axes_only_mode = true;
+    s_oled_wave_mode = target_wave_mode;
     s_oled_wave_pending = false;
     s_oled_wave_prev_valid = false;
     s_oled_wave_x = 0U;
     OLED_ClearWaveAndKeepAxes();
-    OLED_UpdateVitalsText();
-    s_last_oled_text_tick = now;
-    s_oled_rate_dirty = false;
-  }
-  else if (!should_axes_only && s_oled_axes_only_mode)
-  {
-    s_oled_axes_only_mode = false;
-    s_oled_wave_prev_valid = false;
+
     OLED_UpdateVitalsText();
     s_last_oled_text_tick = now;
     s_oled_rate_dirty = false;
@@ -765,7 +905,7 @@ static void OLED_Service(void)
 
   if (s_oled_wave_pending && ((now - s_last_oled_wave_tick) >= OLED_WAVE_UPDATE_MS))
   {
-    if (!s_oled_axes_only_mode)
+    if (s_oled_wave_mode == OLED_WAVE_MODE_NORMAL)
     {
       OLED_PlotWaveColumn(s_pending_breath_phase, s_pending_heart_phase);
     }
@@ -799,9 +939,13 @@ static void OLED_UI_Init(void)
   s_radar_data_online = false;
   s_human_detect_valid = false;
   s_human_present = false;
+  s_human_candidate_present = false;
+  s_human_candidate_count = 0U;
   s_target_range_valid = false;
   s_target_range_cm = 0.0f;
-  s_oled_axes_only_mode = true;
+  s_target_range_filtered_cm = 0.0f;
+  s_range_state = LD6002_RANGE_UNKNOWN;
+  s_oled_wave_mode = OLED_WAVE_MODE_AXES_ONLY;
   s_oled_panel_drawn_mode = OLED_PANEL_MODE_COUNT;
   s_oled_rate_dirty = true;
   s_oled_wave_pending = false;
@@ -845,15 +989,8 @@ static void LD6002_LogFrame(const LD6002_Frame *frame)
     if (frame->len >= 2U)
     {
       uint16_t is_human = (uint16_t)frame->data[0] | ((uint16_t)frame->data[1] << 8);
-      bool human_present = (is_human != 0U);
 
-      if ((!s_human_detect_valid) || (s_human_present != human_present))
-      {
-        s_oled_rate_dirty = true;
-      }
-
-      s_human_detect_valid = true;
-      s_human_present = human_present;
+      LD6002_UpdateHumanPresence(is_human != 0U);
 
       UART1_Sendf("[RADAR] TYPE=0x0F09 ID=0x%04X Human=%u\r\n", frame->id, (unsigned)is_human);
     }
@@ -899,9 +1036,7 @@ static void LD6002_LogFrame(const LD6002_Frame *frame)
       uint32_t flag = LD6002_U32Le(&frame->data[0]);
       float range = LD6002_F32Le(&frame->data[4]);
 
-      s_target_range_cm = range;
-      s_target_range_valid = true;
-      s_oled_rate_dirty = true;
+      LD6002_UpdateTargetRange(flag, range);
 
       LD6002_FormatFloat(range, a, sizeof(a));
       UART1_Sendf("[RADAR] TYPE=0x0A16 ID=0x%04X Flag=%lu Range=%s cm\r\n", frame->id, (unsigned long)flag, a);
