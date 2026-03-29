@@ -177,6 +177,12 @@ typedef enum
 /* UART1 汇总信息发送周期（ms）。 */
 #define UART1_SUMMARY_INTERVAL_MS 200U
 
+/* LED 告警参数（默认使用 PC13 板载灯，低电平点亮）。 */
+#define ALERT_LED_GPIO_Port GPIOC
+#define ALERT_LED_Pin       GPIO_PIN_13
+#define ALERT_LED_ACTIVE_LOW 1U
+#define ALERT_LED_BLINK_MS  500U
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -207,6 +213,11 @@ static volatile bool s_uart2_rx_rearm_pending;
 static volatile uint32_t s_uart2_rx_rearm_fail_count;
 static volatile uint32_t s_uart2_rx_rearm_busy_count;
 static uint32_t s_uart2_rx_rearm_ok_count;
+
+/* LED 告警闪烁状态。 */
+static bool s_alert_led_on;
+static bool s_alert_led_blink_active;
+static uint32_t s_last_alert_led_toggle_tick;
 
 /* OLED 显示与最新生理参数缓存。 */
 static bool s_oled_ready;
@@ -259,6 +270,9 @@ static bool LD6002_QueuePop(LD6002_Frame *frame);
 static void LD6002_StartUart2Rx(void);
 static HAL_StatusTypeDef LD6002_RearmUart2Rx(void);
 static void LD6002_ServiceUart2RxRecovery(void);
+static void AlertLed_Set(bool on);
+static bool AlertLed_ShouldBlink(void);
+static void AlertLed_Service(void);
 static uint32_t LD6002_U32Le(const uint8_t *buf);
 static float LD6002_F32Le(const uint8_t *buf);
 static void LD6002_UpdateHumanPresence(bool raw_human_present);
@@ -512,6 +526,66 @@ static void LD6002_ServiceUart2RxRecovery(void)
   if (LD6002_RearmUart2Rx() == HAL_OK)
   {
     s_uart2_rx_rearm_ok_count++;
+  }
+}
+
+/* 控制告警灯亮灭。 */
+static void AlertLed_Set(bool on)
+{
+  GPIO_PinState state;
+
+  if (ALERT_LED_ACTIVE_LOW != 0U)
+  {
+    state = on ? GPIO_PIN_RESET : GPIO_PIN_SET;
+  }
+  else
+  {
+    state = on ? GPIO_PIN_SET : GPIO_PIN_RESET;
+  }
+
+  HAL_GPIO_WritePin(ALERT_LED_GPIO_Port, ALERT_LED_Pin, state);
+  s_alert_led_on = on;
+}
+
+/* 判定是否需要进入 LED 告警闪烁。 */
+static bool AlertLed_ShouldBlink(void)
+{
+  bool no_data_alarm = !s_radar_data_online;
+  bool no_human_alarm = s_human_detect_valid && !s_human_present;
+  bool range_alarm = s_target_range_valid &&
+                     ((s_range_state == LD6002_RANGE_TOO_NEAR) || (s_range_state == LD6002_RANGE_TOO_FAR));
+
+  return (no_data_alarm || no_human_alarm || range_alarm);
+}
+
+/* LED 告警任务：无数据、无人或距离异常时闪烁，否则熄灭。 */
+static void AlertLed_Service(void)
+{
+  uint32_t now = HAL_GetTick();
+  bool should_blink = AlertLed_ShouldBlink();
+
+  if (!should_blink)
+  {
+    s_alert_led_blink_active = false;
+    if (s_alert_led_on)
+    {
+      AlertLed_Set(false);
+    }
+    return;
+  }
+
+  if (!s_alert_led_blink_active)
+  {
+    s_alert_led_blink_active = true;
+    s_last_alert_led_toggle_tick = now;
+    AlertLed_Set(true);
+    return;
+  }
+
+  if ((now - s_last_alert_led_toggle_tick) >= ALERT_LED_BLINK_MS)
+  {
+    s_last_alert_led_toggle_tick = now;
+    AlertLed_Set(!s_alert_led_on);
   }
 }
 
@@ -1322,6 +1396,9 @@ int main(void)
     /* 消费并处理雷达帧。 */
     LD6002_ProcessFrames();
 
+    /* 人员/距离异常 LED 告警闪烁。 */
+    AlertLed_Service();
+
     /* 刷新 OLED 波形与状态文本。 */
     OLED_Service();
 
@@ -1486,6 +1563,24 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+
+  /* 默认关闭告警灯。 */
+  if (ALERT_LED_ACTIVE_LOW != 0U)
+  {
+    HAL_GPIO_WritePin(ALERT_LED_GPIO_Port, ALERT_LED_Pin, GPIO_PIN_SET);
+  }
+  else
+  {
+    HAL_GPIO_WritePin(ALERT_LED_GPIO_Port, ALERT_LED_Pin, GPIO_PIN_RESET);
+  }
+
+  /* 配置告警灯引脚为推挽输出。 */
+  GPIO_InitStruct.Pin = ALERT_LED_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(ALERT_LED_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : RADAR_STATUS_Pin */
   GPIO_InitStruct.Pin = RADAR_STATUS_Pin;
