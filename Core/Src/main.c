@@ -32,6 +32,10 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+/*
+ * LD6002 串口帧按字节解析状态机。
+ * 解析器每收到 1 字节就推进一次状态，直到得到完整且校验通过的一帧。
+ */
 typedef enum
 {
   LD6002_WAIT_SOF = 0,
@@ -46,6 +50,7 @@ typedef enum
   LD6002_DATA_CKSUM
 } LD6002_ParseState;
 
+/* 一帧完整解析后的数据结构。 */
 typedef struct
 {
   uint16_t id;
@@ -54,6 +59,7 @@ typedef struct
   uint8_t data[128];
 } LD6002_Frame;
 
+/* UART 中断解析上下文，保存解析过程中的临时状态。 */
 typedef struct
 {
   LD6002_ParseState state;
@@ -63,6 +69,7 @@ typedef struct
   LD6002_Frame frame;
 } LD6002_Parser;
 
+/* OLED 右侧信息区显示模式。 */
 typedef enum
 {
   OLED_PANEL_VITALS = 0,
@@ -73,6 +80,7 @@ typedef enum
   OLED_PANEL_MODE_COUNT
 } OLED_RightPanelMode;
 
+/* 距离分类结果，用于右侧提示与波形模式切换。 */
 typedef enum
 {
   LD6002_RANGE_UNKNOWN = 0,
@@ -81,6 +89,7 @@ typedef enum
   LD6002_RANGE_TOO_FAR
 } LD6002_RangeState;
 
+/* 左侧波形区域渲染模式。 */
 typedef enum
 {
   OLED_WAVE_MODE_NORMAL = 0,
@@ -91,6 +100,7 @@ typedef enum
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+/* 协议与串口基础参数。 */
 #define LD6002_SOF 0x01U
 #define LD6002_MAX_PAYLOAD_LEN 128U
 #define LD6002_FRAME_QUEUE_SIZE 16U
@@ -99,16 +109,26 @@ typedef enum
 #define LD6002_HUMAN_ENTER_CONFIRM_FRAMES 2U
 #define LD6002_HUMAN_LEAVE_CONFIRM_FRAMES 1U
 
+/*
+ * 距离阈值（单位：cm）。
+ * MIN/MAX：进入过近/过远告警的硬阈值。
+ * *_RELEASE：基于滤波值的告警释放阈值（抑制抖动）。
+ * *_FAST_RELEASE：基于原始值的快速释放阈值（改善恢复速度）。
+ */
 #define LD6002_TARGET_RANGE_MIN_CM 35.0f
 #define LD6002_TARGET_RANGE_MAX_CM 100.0f
 #define LD6002_TARGET_RANGE_NEAR_RELEASE_CM 36.0f
 #define LD6002_TARGET_RANGE_FAR_RELEASE_CM 99.0f
+#define LD6002_TARGET_RANGE_NEAR_FAST_RELEASE_CM 38.0f
+#define LD6002_TARGET_RANGE_FAR_FAST_RELEASE_CM 97.0f
 #define LD6002_RANGE_FILTER_ALPHA 0.75f
 
+/* 左侧波形区几何范围（x=0..95）。 */
 #define OLED_WAVE_X_START 0U
 #define OLED_WAVE_X_END   95U
 #define OLED_WAVE_WIDTH   ((OLED_WAVE_X_END - OLED_WAVE_X_START) + 1U)
 
+/* 右侧信息区几何范围（x=96..127）。 */
 #define OLED_VALUE_AREA_X_START 96U
 #define OLED_VALUE_AREA_X_END   127U
 #define OLED_VALUE_AREA_WIDTH   ((OLED_VALUE_AREA_X_END - OLED_VALUE_AREA_X_START) + 1U)
@@ -116,13 +136,16 @@ typedef enum
 #define OLED_VALUE_LABEL_X OLED_VALUE_AREA_X_START
 #define OLED_VALUE_DATA_X  100U
 
+/* 英文提示居中时的 x 坐标辅助量。 */
 #define OLED_TEXT_2CHAR_X (OLED_VALUE_AREA_X_START + ((OLED_VALUE_AREA_WIDTH - 16U) / 2U))
 #define OLED_TEXT_3CHAR_X (OLED_VALUE_AREA_X_START + ((OLED_VALUE_AREA_WIDTH - 24U) / 2U))
 #define OLED_TEXT_4CHAR_X (OLED_VALUE_AREA_X_START + ((OLED_VALUE_AREA_WIDTH - 32U) / 2U))
 
+/* 8x16 字体对应页坐标。 */
 #define OLED_TEXT_LINE1_Y 5U
 #define OLED_TEXT_LINE2_Y 6U
 
+/* 中文字模索引（来源于 oledfont.h 的 Hzk 表）。 */
 #define OLED_ZH_XIN 0U
 #define OLED_ZH_LV  1U
 #define OLED_ZH_HU  2U
@@ -132,18 +155,22 @@ typedef enum
 #define OLED_ZH_CUO 10U
 #define OLED_ZH_WU2 11U
 
+/* 呼吸波形区域与幅度映射参数。 */
 #define OLED_BREATH_Y_MIN    1U
 #define OLED_BREATH_Y_MAX    30U
 #define OLED_BREATH_CENTER_Y 15U
 #define OLED_BREATH_GAIN     22.0f
 
+/* 心率波形区域与幅度映射参数。 */
 #define OLED_HEART_Y_MIN    33U
 #define OLED_HEART_Y_MAX    62U
 #define OLED_HEART_CENTER_Y 47U
 #define OLED_HEART_GAIN     18.0f
 
+/* 上下波形分割虚线的 y 坐标。 */
 #define OLED_WAVE_SPLIT_Y 31U
 
+/* OLED 刷新周期（ms）。 */
 #define OLED_WAVE_UPDATE_MS 50U
 #define OLED_TEXT_UPDATE_MS 200U
 
@@ -161,6 +188,7 @@ UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
+/* UART2 按字节接收与解析队列状态。 */
 static uint8_t s_uart2_rx_byte;
 static LD6002_Parser s_ld6002_parser;
 static LD6002_Frame s_frame_queue[LD6002_FRAME_QUEUE_SIZE];
@@ -175,7 +203,13 @@ static uint32_t s_last_dropped_report;
 static uint32_t s_last_cksum_report;
 static uint32_t s_last_len_report;
 static uint32_t s_last_sof_report;
+static volatile bool s_uart2_rx_rearm_pending;
+static volatile uint32_t s_uart2_rx_rearm_fail_count;
+static volatile uint32_t s_uart2_rx_rearm_busy_count;
+static uint32_t s_uart2_rx_rearm_ok_count;
+static uint32_t s_last_uart2_rearm_log_tick;
 
+/* OLED 显示与最新生理参数缓存。 */
 static bool s_oled_ready;
 static bool s_oled_rate_dirty;
 static bool s_oled_wave_pending;
@@ -192,16 +226,19 @@ static uint32_t s_last_oled_text_tick;
 static uint32_t s_last_radar_frame_tick;
 static bool s_radar_data_online;
 
+/* 有人/无人确认状态（含去抖）。 */
 static bool s_human_detect_valid;
 static bool s_human_present;
 static bool s_human_candidate_present;
 static uint8_t s_human_candidate_count;
 
+/* 距离有效性、滤波值与分类状态。 */
 static bool s_target_range_valid;
 static float s_target_range_cm;
 static float s_target_range_filtered_cm;
 static LD6002_RangeState s_range_state;
 
+/* 当前已经应用到 OLED 的波形模式和右侧模式。 */
 static OLED_WaveMode s_oled_wave_mode;
 static OLED_RightPanelMode s_oled_panel_drawn_mode;
 
@@ -219,12 +256,16 @@ static uint8_t LD6002_Checksum(const uint8_t *data, uint16_t len);
 static bool LD6002_ConsumeByte(LD6002_Parser *parser, uint8_t byte, LD6002_Frame *out_frame);
 static void LD6002_QueuePushFromISR(const LD6002_Frame *frame);
 static bool LD6002_QueuePop(LD6002_Frame *frame);
+/* UART2 接收挂接：普通路径和错误恢复路径统一入口。 */
 static void LD6002_StartUart2Rx(void);
+static HAL_StatusTypeDef LD6002_RearmUart2Rx(void);
+static void LD6002_ServiceUart2RxRecovery(void);
 static uint32_t LD6002_U32Le(const uint8_t *buf);
 static float LD6002_F32Le(const uint8_t *buf);
 static void LD6002_FormatFloat(float value, char *out, size_t out_size);
 static void LD6002_UpdateHumanPresence(bool raw_human_present);
 static LD6002_RangeState LD6002_ClassifyRangeState(float raw_range_cm,
+                                                    float filtered_range_cm,
                                                     LD6002_RangeState prev_state);
 static void LD6002_UpdateTargetRange(uint32_t flag, float range_cm);
 
@@ -252,6 +293,7 @@ static void OLED_UI_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+/* 解析器复位：任何错误或一帧完成后都回到等待 SOF 状态。 */
 static void LD6002_ParserReset(LD6002_Parser *parser)
 {
   parser->state = LD6002_WAIT_SOF;
@@ -262,6 +304,7 @@ static void LD6002_ParserReset(LD6002_Parser *parser)
   parser->frame.type = 0U;
 }
 
+/* LD6002 校验规则：按字节异或后取反。 */
 static uint8_t LD6002_Checksum(const uint8_t *data, uint16_t len)
 {
   uint8_t cksum = 0U;
@@ -275,12 +318,17 @@ static uint8_t LD6002_Checksum(const uint8_t *data, uint16_t len)
   return (uint8_t)(~cksum);
 }
 
+/*
+ * 按字节推进解析状态机。
+ * 返回 true 表示得到一帧完整且校验通过的 LD6002 数据。
+ */
 static bool LD6002_ConsumeByte(LD6002_Parser *parser, uint8_t byte, LD6002_Frame *out_frame)
 {
   uint8_t expected_cksum;
 
   switch (parser->state)
   {
+  /* 等待帧头 SOF。 */
   case LD6002_WAIT_SOF:
     if (byte == LD6002_SOF)
     {
@@ -298,6 +346,7 @@ static bool LD6002_ConsumeByte(LD6002_Parser *parser, uint8_t byte, LD6002_Frame
     }
     break;
 
+  /* ID 高/低字节。 */
   case LD6002_ID_HIGH:
     parser->frame.id = ((uint16_t)byte << 8);
     parser->header[parser->header_idx++] = byte;
@@ -310,6 +359,7 @@ static bool LD6002_ConsumeByte(LD6002_Parser *parser, uint8_t byte, LD6002_Frame
     parser->state = LD6002_LEN_HIGH;
     break;
 
+  /* LEN 高/低字节，并做最大长度保护。 */
   case LD6002_LEN_HIGH:
     parser->frame.len = ((uint16_t)byte << 8);
     parser->header[parser->header_idx++] = byte;
@@ -330,6 +380,7 @@ static bool LD6002_ConsumeByte(LD6002_Parser *parser, uint8_t byte, LD6002_Frame
     }
     break;
 
+  /* TYPE 高/低字节。 */
   case LD6002_TYPE_HIGH:
     parser->frame.type = ((uint16_t)byte << 8);
     parser->header[parser->header_idx++] = byte;
@@ -342,6 +393,7 @@ static bool LD6002_ConsumeByte(LD6002_Parser *parser, uint8_t byte, LD6002_Frame
     parser->state = LD6002_HEAD_CKSUM;
     break;
 
+  /* 头部校验通过后，进入数据段或数据校验。 */
   case LD6002_HEAD_CKSUM:
     expected_cksum = LD6002_Checksum(parser->header, (uint16_t)sizeof(parser->header));
     if (byte != expected_cksum)
@@ -362,6 +414,7 @@ static bool LD6002_ConsumeByte(LD6002_Parser *parser, uint8_t byte, LD6002_Frame
     }
     break;
 
+  /* 按 LEN 收集数据区。 */
   case LD6002_DATA:
     parser->frame.data[parser->data_idx++] = byte;
     if (parser->data_idx >= parser->frame.len)
@@ -370,6 +423,7 @@ static bool LD6002_ConsumeByte(LD6002_Parser *parser, uint8_t byte, LD6002_Frame
     }
     break;
 
+  /* 数据校验通过后输出完整帧。 */
   case LD6002_DATA_CKSUM:
     expected_cksum = LD6002_Checksum(parser->frame.data, parser->frame.len);
     if (byte == expected_cksum)
@@ -391,6 +445,7 @@ static bool LD6002_ConsumeByte(LD6002_Parser *parser, uint8_t byte, LD6002_Frame
   return false;
 }
 
+/* ISR 中入队：满队列时丢帧并计数。 */
 static void LD6002_QueuePushFromISR(const LD6002_Frame *frame)
 {
   uint8_t next_head = (uint8_t)((s_frame_head + 1U) % LD6002_FRAME_QUEUE_SIZE);
@@ -405,6 +460,7 @@ static void LD6002_QueuePushFromISR(const LD6002_Frame *frame)
   s_frame_head = next_head;
 }
 
+/* 主循环中出队：空队列返回 false。 */
 static bool LD6002_QueuePop(LD6002_Frame *frame)
 {
   if (s_frame_tail == s_frame_head)
@@ -417,14 +473,70 @@ static bool LD6002_QueuePop(LD6002_Frame *frame)
   return true;
 }
 
+/* 启动 UART2 一字节中断接收。 */
 static void LD6002_StartUart2Rx(void)
 {
-  if (HAL_UART_Receive_IT(&huart2, &s_uart2_rx_byte, 1U) != HAL_OK)
+  if (LD6002_RearmUart2Rx() != HAL_OK)
   {
-    UART1_SendText("[RADAR] UART2 RX start failed\r\n");
+    UART1_SendText("[RADAR] UART2 RX start pending retry\r\n");
   }
 }
 
+/*
+ * 尝试重新挂接 UART2 中断接收。
+ * 失败时打标记，由主循环持续重试，避免链路静默中断。
+ */
+static HAL_StatusTypeDef LD6002_RearmUart2Rx(void)
+{
+  HAL_StatusTypeDef status = HAL_UART_Receive_IT(&huart2, &s_uart2_rx_byte, 1U);
+
+  if (status == HAL_OK)
+  {
+    s_uart2_rx_rearm_pending = false;
+    return status;
+  }
+
+  s_uart2_rx_rearm_pending = true;
+  s_uart2_rx_rearm_fail_count++;
+  if (status == HAL_BUSY)
+  {
+    s_uart2_rx_rearm_busy_count++;
+  }
+
+  return status;
+}
+
+/* 主循环中的 UART2 恢复服务：重试并做限频告警日志。 */
+static void LD6002_ServiceUart2RxRecovery(void)
+{
+  uint32_t now;
+
+  if (!s_uart2_rx_rearm_pending)
+  {
+    return;
+  }
+
+  if (LD6002_RearmUart2Rx() == HAL_OK)
+  {
+    s_uart2_rx_rearm_ok_count++;
+    UART1_Sendf("[RADAR][UART2] RX rearm recovered fail=%lu busy=%lu ok=%lu\r\n",
+                (unsigned long)s_uart2_rx_rearm_fail_count,
+                (unsigned long)s_uart2_rx_rearm_busy_count,
+                (unsigned long)s_uart2_rx_rearm_ok_count);
+    return;
+  }
+
+  now = HAL_GetTick();
+  if ((now - s_last_uart2_rearm_log_tick) >= 1000U)
+  {
+    s_last_uart2_rearm_log_tick = now;
+    UART1_Sendf("[RADAR][WARN] UART2 RX rearm pending fail=%lu busy=%lu\r\n",
+                (unsigned long)s_uart2_rx_rearm_fail_count,
+                (unsigned long)s_uart2_rx_rearm_busy_count);
+  }
+}
+
+/* 读取小端 uint32。 */
 static uint32_t LD6002_U32Le(const uint8_t *buf)
 {
   return ((uint32_t)buf[0]) |
@@ -433,6 +545,7 @@ static uint32_t LD6002_U32Le(const uint8_t *buf)
          ((uint32_t)buf[3] << 24);
 }
 
+/* 读取小端 float。 */
 static float LD6002_F32Le(const uint8_t *buf)
 {
   uint32_t raw = LD6002_U32Le(buf);
@@ -441,6 +554,7 @@ static float LD6002_F32Le(const uint8_t *buf)
   return value;
 }
 
+/* 浮点格式化为固定 3 位小数，便于串口日志查看。 */
 static void LD6002_FormatFloat(float value, char *out, size_t out_size)
 {
   int32_t scaled = (int32_t)(value * 1000.0f);
@@ -458,6 +572,10 @@ static void LD6002_FormatFloat(float value, char *out, size_t out_size)
   }
 }
 
+/*
+ * 有人状态确认（去抖）：
+ * 进入有人和离开有人使用不同确认帧数。
+ */
 static void LD6002_UpdateHumanPresence(bool raw_human_present)
 {
   uint8_t required_frames = raw_human_present ? LD6002_HUMAN_ENTER_CONFIRM_FRAMES : LD6002_HUMAN_LEAVE_CONFIRM_FRAMES;
@@ -484,7 +602,13 @@ static void LD6002_UpdateHumanPresence(bool raw_human_present)
   }
 }
 
+/*
+ * 距离状态分类：
+ * 1) 原始值用于快速进入和快速释放；
+ * 2) 滤波值用于边界稳定，减少抖动闪烁。
+ */
 static LD6002_RangeState LD6002_ClassifyRangeState(float raw_range_cm,
+                                                    float filtered_range_cm,
                                                     LD6002_RangeState prev_state)
 {
   if (raw_range_cm < LD6002_TARGET_RANGE_MIN_CM)
@@ -500,16 +624,41 @@ static LD6002_RangeState LD6002_ClassifyRangeState(float raw_range_cm,
   switch (prev_state)
   {
   case LD6002_RANGE_TOO_NEAR:
-    return (raw_range_cm < LD6002_TARGET_RANGE_NEAR_RELEASE_CM) ? LD6002_RANGE_TOO_NEAR : LD6002_RANGE_NORMAL;
+    if (raw_range_cm > LD6002_TARGET_RANGE_NEAR_FAST_RELEASE_CM)
+    {
+      return LD6002_RANGE_NORMAL;
+    }
+
+    return (filtered_range_cm < LD6002_TARGET_RANGE_NEAR_RELEASE_CM) ? LD6002_RANGE_TOO_NEAR : LD6002_RANGE_NORMAL;
 
   case LD6002_RANGE_TOO_FAR:
-    return (raw_range_cm > LD6002_TARGET_RANGE_FAR_RELEASE_CM) ? LD6002_RANGE_TOO_FAR : LD6002_RANGE_NORMAL;
+    if (raw_range_cm < LD6002_TARGET_RANGE_FAR_FAST_RELEASE_CM)
+    {
+      return LD6002_RANGE_NORMAL;
+    }
+
+    return (filtered_range_cm > LD6002_TARGET_RANGE_FAR_RELEASE_CM) ? LD6002_RANGE_TOO_FAR : LD6002_RANGE_NORMAL;
 
   default:
+    if (filtered_range_cm < LD6002_TARGET_RANGE_MIN_CM)
+    {
+      return LD6002_RANGE_TOO_NEAR;
+    }
+
+    if (filtered_range_cm > LD6002_TARGET_RANGE_MAX_CM)
+    {
+      return LD6002_RANGE_TOO_FAR;
+    }
+
     return LD6002_RANGE_NORMAL;
   }
 }
 
+/*
+ * 处理 0x0A16 距离帧：
+ * - flag=1：有效距离，更新滤波和分类；
+ * - flag=0：视为无人证据，并清理距离有效状态。
+ */
 static void LD6002_UpdateTargetRange(uint32_t flag, float range_cm)
 {
   LD6002_RangeState prev_state;
@@ -553,7 +702,7 @@ static void LD6002_UpdateTargetRange(uint32_t flag, float range_cm)
                                  ((1.0f - LD6002_RANGE_FILTER_ALPHA) * s_target_range_filtered_cm);
   }
 
-  next_state = LD6002_ClassifyRangeState(range_cm, prev_state);
+  next_state = LD6002_ClassifyRangeState(range_cm, s_target_range_filtered_cm, prev_state);
 
   if ((!s_target_range_valid) || (next_state != prev_state))
   {
@@ -567,6 +716,7 @@ static void LD6002_UpdateTargetRange(uint32_t flag, float range_cm)
 
 static uint8_t OLED_MapPhaseToY(float value, uint8_t center_y, float gain, uint8_t y_min, uint8_t y_max)
 {
+  /* 将相位值映射到屏幕 y 坐标，并限制在有效显示区间。 */
   int32_t y = (int32_t)center_y - (int32_t)(value * gain);
 
   if (y < (int32_t)y_min)
@@ -581,6 +731,7 @@ static uint8_t OLED_MapPhaseToY(float value, uint8_t center_y, float gain, uint8
   return (uint8_t)y;
 }
 
+/* Bresenham 直线算法：连接相邻采样点，避免波形断裂。 */
 static void OLED_DrawLine(uint8_t x0, uint8_t y0, uint8_t x1, uint8_t y1)
 {
   int16_t dx = (int16_t)x1 - (int16_t)x0;
@@ -617,6 +768,7 @@ static void OLED_DrawLine(uint8_t x0, uint8_t y0, uint8_t x1, uint8_t y1)
   }
 }
 
+/* 绘制左侧波形区域的静态坐标轴。 */
 static void OLED_DrawWaveAxes(void)
 {
   uint8_t x;
@@ -633,6 +785,7 @@ static void OLED_DrawWaveAxes(void)
   }
 }
 
+/* 清空波形区并立即重绘坐标轴。 */
 static void OLED_ClearWaveAndKeepAxes(void)
 {
   uint8_t x;
@@ -650,6 +803,7 @@ static void OLED_ClearWaveAndKeepAxes(void)
   OLED_RefreshDirty();
 }
 
+/* 根据在线状态/有人状态/距离状态决定右侧提示模式。 */
 static OLED_RightPanelMode OLED_GetPanelMode(void)
 {
   if (!s_radar_data_online)
@@ -678,6 +832,7 @@ static OLED_RightPanelMode OLED_GetPanelMode(void)
   return OLED_PANEL_VITALS;
 }
 
+/* 根据右侧模式决定左侧波形是否绘制实时曲线。 */
 static OLED_WaveMode OLED_GetWaveMode(void)
 {
   OLED_RightPanelMode panel_mode = OLED_GetPanelMode();
@@ -693,6 +848,7 @@ static OLED_WaveMode OLED_GetWaveMode(void)
   return OLED_WAVE_MODE_NORMAL;
 }
 
+/* 右侧信息区整屏重绘：先清空，再按模式绘制内容。 */
 static void OLED_DrawPanelMode(OLED_RightPanelMode mode)
 {
   OLED_Fill(OLED_VALUE_AREA_X_START, 0U, OLED_VALUE_AREA_X_END, 63U, 0U);
@@ -739,6 +895,7 @@ static void OLED_DrawPanelMode(OLED_RightPanelMode mode)
   }
 }
 
+/* 绘制一列波形（x 方向滚动），包含呼吸与心率两条曲线。 */
 static void OLED_PlotWaveColumn(float breath_phase, float heart_phase)
 {
   uint8_t x = (uint8_t)(OLED_WAVE_X_START + s_oled_wave_x);
@@ -796,6 +953,7 @@ static void OLED_PlotWaveColumn(float breath_phase, float heart_phase)
   OLED_RefreshDirty();
 }
 
+/* 更新右侧文字：模式提示或呼吸/心率数值。 */
 static void OLED_UpdateVitalsText(void)
 {
   OLED_RightPanelMode panel_mode;
@@ -848,18 +1006,21 @@ static void OLED_UpdateVitalsText(void)
   OLED_ShowString(OLED_VALUE_DATA_X, 6U, (u8 *)hr_text, 8U);
 }
 
+/* 缓存最新呼吸率并请求文本刷新。 */
 static void OLED_SetBreathRate(float rate)
 {
   s_latest_breath_rate = rate;
   s_oled_rate_dirty = true;
 }
 
+/* 缓存最新心率并请求文本刷新。 */
 static void OLED_SetHeartRate(float rate)
 {
   s_latest_heart_rate = rate;
   s_oled_rate_dirty = true;
 }
 
+/* 缓存最新相位数据，由 OLED_Service 统一调度绘图。 */
 static void OLED_SetPhases(float breath_phase, float heart_phase)
 {
   s_pending_breath_phase = breath_phase;
@@ -867,6 +1028,13 @@ static void OLED_SetPhases(float breath_phase, float heart_phase)
   s_oled_wave_pending = true;
 }
 
+/*
+ * OLED 任务调度：
+ * 1) 在线超时检测
+ * 2) 模式切换处理
+ * 3) 波形刷新
+ * 4) 文本刷新
+ */
 static void OLED_Service(void)
 {
   uint32_t now;
@@ -881,6 +1049,7 @@ static void OLED_Service(void)
 
   if (s_radar_data_online && ((now - s_last_radar_frame_tick) >= LD6002_NO_DATA_TIMEOUT_MS))
   {
+    /* 长时间未收到雷达帧：回退为离线状态。 */
     s_radar_data_online = false;
     s_human_detect_valid = false;
     s_human_candidate_count = 0U;
@@ -892,6 +1061,7 @@ static void OLED_Service(void)
   target_wave_mode = OLED_GetWaveMode();
   if (target_wave_mode != s_oled_wave_mode)
   {
+    /* 模式变化时，重置滚动游标并清空旧波形残留。 */
     s_oled_wave_mode = target_wave_mode;
     s_oled_wave_pending = false;
     s_oled_wave_prev_valid = false;
@@ -916,12 +1086,14 @@ static void OLED_Service(void)
 
   if (s_oled_rate_dirty && ((now - s_last_oled_text_tick) >= OLED_TEXT_UPDATE_MS))
   {
+    /* 文本刷新频率低于波形刷新，减少 I2C 带宽占用。 */
     OLED_UpdateVitalsText();
     s_last_oled_text_tick = now;
     s_oled_rate_dirty = false;
   }
 }
 
+/* OLED 初始化与运行时状态清零。 */
 static void OLED_UI_Init(void)
 {
   OLED_Init();
@@ -953,6 +1125,7 @@ static void OLED_UI_Init(void)
   OLED_UpdateVitalsText();
 }
 
+/* 向上位机发送纯文本日志。 */
 static void UART1_SendText(const char *text)
 {
   size_t len = strlen(text);
@@ -962,6 +1135,7 @@ static void UART1_SendText(const char *text)
   }
 }
 
+/* 向上位机发送格式化日志。 */
 static void UART1_Sendf(const char *fmt, ...)
 {
   char tx_buf[192];
@@ -979,6 +1153,7 @@ static void UART1_Sendf(const char *fmt, ...)
   }
 }
 
+/* 按帧类型分发业务逻辑：更新波形、数值和状态。 */
 static void LD6002_LogFrame(const LD6002_Frame *frame)
 {
   char a[20];
@@ -986,6 +1161,7 @@ static void LD6002_LogFrame(const LD6002_Frame *frame)
   switch (frame->type)
   {
   case 0x0F09:
+    /* 人体存在标志。 */
     if (frame->len >= 2U)
     {
       uint16_t is_human = (uint16_t)frame->data[0] | ((uint16_t)frame->data[1] << 8);
@@ -997,6 +1173,7 @@ static void LD6002_LogFrame(const LD6002_Frame *frame)
     break;
 
   case 0x0A13:
+    /* 呼吸/心率相位。 */
     if (frame->len >= 12U)
     {
       float breath_phase = LD6002_F32Le(&frame->data[4]);
@@ -1007,6 +1184,7 @@ static void LD6002_LogFrame(const LD6002_Frame *frame)
     break;
 
   case 0x0A14:
+    /* 呼吸率。 */
     if (frame->len >= 4U)
     {
       float breath_rate = LD6002_F32Le(&frame->data[0]);
@@ -1019,6 +1197,7 @@ static void LD6002_LogFrame(const LD6002_Frame *frame)
     break;
 
   case 0x0A15:
+    /* 心率。 */
     if (frame->len >= 4U)
     {
       float heart_rate = LD6002_F32Le(&frame->data[0]);
@@ -1031,6 +1210,7 @@ static void LD6002_LogFrame(const LD6002_Frame *frame)
     break;
 
   case 0x0A16:
+    /* 距离状态与目标距离。 */
     if (frame->len >= 8U)
     {
       uint32_t flag = LD6002_U32Le(&frame->data[0]);
@@ -1048,6 +1228,7 @@ static void LD6002_LogFrame(const LD6002_Frame *frame)
   }
 }
 
+/* 主循环消费所有队列帧，并维护在线状态。 */
 static void LD6002_ProcessFrames(void)
 {
   LD6002_Frame frame;
@@ -1057,6 +1238,7 @@ static void LD6002_ProcessFrames(void)
     s_last_radar_frame_tick = HAL_GetTick();
     if (!s_radar_data_online)
     {
+      /* 离线恢复为在线后，触发 UI 模式刷新。 */
       s_radar_data_online = true;
       s_oled_rate_dirty = true;
     }
@@ -1065,6 +1247,7 @@ static void LD6002_ProcessFrames(void)
   }
 }
 
+/* 每秒输出一次变化后的统计计数。 */
 static void LD6002_ReportStats(void)
 {
   uint32_t now = HAL_GetTick();
@@ -1144,8 +1327,16 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    /* UART2 失败重挂接恢复服务。 */
+    LD6002_ServiceUart2RxRecovery();
+
+    /* 消费并处理雷达帧。 */
     LD6002_ProcessFrames();
+
+    /* 刷新 OLED 波形与状态文本。 */
     OLED_Service();
+
+    /* 输出运行期统计信息。 */
     LD6002_ReportStats();
   }
   /* USER CODE END 3 */
@@ -1321,6 +1512,7 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
+  /* UART2 接收完成中断：解析当前字节并立即重挂接下一字节接收。 */
   LD6002_Frame frame;
 
   if (huart->Instance == USART2)
@@ -1330,16 +1522,17 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
       LD6002_QueuePushFromISR(&frame);
     }
 
-    (void)HAL_UART_Receive_IT(&huart2, &s_uart2_rx_byte, 1U);
+    (void)LD6002_RearmUart2Rx();
   }
 }
 
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
+  /* UART2 错误中断：复位解析器并进入统一重挂接流程。 */
   if (huart->Instance == USART2)
   {
     LD6002_ParserReset(&s_ld6002_parser);
-    (void)HAL_UART_Receive_IT(&huart2, &s_uart2_rx_byte, 1U);
+    (void)LD6002_RearmUart2Rx();
   }
 }
 
