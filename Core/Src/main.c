@@ -174,6 +174,11 @@ typedef enum
 #define OLED_WAVE_UPDATE_MS 50U
 #define OLED_TEXT_UPDATE_MS 200U
 
+/* 呼吸/心率低值告警阈值及标签闪烁周期（ms）。 */
+#define OLED_BREATH_LOW_THRESHOLD 5.0f
+#define OLED_HEART_LOW_THRESHOLD 40.0f
+#define OLED_LOW_LABEL_BLINK_MS 500U
+
 /* UART1 汇总信息发送周期（ms）。 */
 #define UART1_SUMMARY_INTERVAL_MS 200U
 
@@ -235,6 +240,11 @@ static uint32_t s_last_oled_wave_tick;
 static uint32_t s_last_oled_text_tick;
 static uint32_t s_last_radar_frame_tick;
 static bool s_radar_data_online;
+static bool s_oled_low_label_visible;
+static uint32_t s_last_oled_low_label_blink_tick;
+static bool s_oled_label_state_valid;
+static bool s_oled_breath_label_drawn;
+static bool s_oled_heart_label_drawn;
 
 /* 有人/无人确认状态（含去抖）。 */
 static bool s_human_detect_valid;
@@ -292,6 +302,7 @@ static void OLED_DrawWaveAxes(void);
 static void OLED_ClearWaveAndKeepAxes(void);
 static OLED_RightPanelMode OLED_GetPanelMode(void);
 static OLED_WaveMode OLED_GetWaveMode(void);
+static void OLED_UpdateVitalsLabels(void);
 static void OLED_DrawPanelMode(OLED_RightPanelMode mode);
 static void OLED_PlotWaveColumn(float breath_phase, float heart_phase);
 static void OLED_UpdateVitalsText(void);
@@ -887,18 +898,62 @@ static OLED_WaveMode OLED_GetWaveMode(void)
   return OLED_WAVE_MODE_NORMAL;
 }
 
+/*
+ * 刷新右侧“呼吸/心率”标签。
+ * 当对应数值过低时，标签按 s_oled_low_label_visible 状态闪烁。
+ */
+static void OLED_UpdateVitalsLabels(void)
+{
+  bool breath_low = (s_latest_breath_rate >= 0.0f) && (s_latest_breath_rate < OLED_BREATH_LOW_THRESHOLD);
+  bool heart_low = (s_latest_heart_rate >= 0.0f) && (s_latest_heart_rate < OLED_HEART_LOW_THRESHOLD);
+  bool show_breath_label = (!breath_low) || s_oled_low_label_visible;
+  bool show_heart_label = (!heart_low) || s_oled_low_label_visible;
+
+  /* 标签显示状态未变化时不重绘，避免未触发告警时出现可见闪烁。 */
+  if (s_oled_label_state_valid &&
+      (show_breath_label == s_oled_breath_label_drawn) &&
+      (show_heart_label == s_oled_heart_label_drawn))
+  {
+    return;
+  }
+
+  if ((!s_oled_label_state_valid) || (show_breath_label != s_oled_breath_label_drawn))
+  {
+    OLED_Fill(OLED_VALUE_LABEL_X, 0U, (u8)(OLED_VALUE_LABEL_X + 31U), 15U, 0U);
+
+    if (show_breath_label)
+    {
+      OLED_ShowCHinese(OLED_VALUE_LABEL_X, 0U, OLED_ZH_HU); /* 呼 */
+      OLED_ShowCHinese((u8)(OLED_VALUE_LABEL_X + 16U), 0U, OLED_ZH_XI); /* 吸 */
+    }
+  }
+
+  if ((!s_oled_label_state_valid) || (show_heart_label != s_oled_heart_label_drawn))
+  {
+    OLED_Fill(OLED_VALUE_LABEL_X, 32U, (u8)(OLED_VALUE_LABEL_X + 31U), 47U, 0U);
+
+    if (show_heart_label)
+    {
+      OLED_ShowCHinese(OLED_VALUE_LABEL_X, 4U, OLED_ZH_XIN); /* 心 */
+      OLED_ShowCHinese((u8)(OLED_VALUE_LABEL_X + 16U), 4U, OLED_ZH_LV); /* 率 */
+    }
+  }
+
+  s_oled_breath_label_drawn = show_breath_label;
+  s_oled_heart_label_drawn = show_heart_label;
+  s_oled_label_state_valid = true;
+}
+
 /* 右侧信息区整屏重绘：先清空，再按模式绘制内容。 */
 static void OLED_DrawPanelMode(OLED_RightPanelMode mode)
 {
   OLED_Fill(OLED_VALUE_AREA_X_START, 0U, OLED_VALUE_AREA_X_END, 63U, 0U);
+  s_oled_label_state_valid = false;
 
   switch (mode)
   {
   case OLED_PANEL_VITALS:
-    OLED_ShowCHinese(OLED_VALUE_LABEL_X, 0U, OLED_ZH_HU); /* 呼 */
-    OLED_ShowCHinese((u8)(OLED_VALUE_LABEL_X + 16U), 0U, OLED_ZH_XI); /* 吸 */
-    OLED_ShowCHinese(OLED_VALUE_LABEL_X, 4U, OLED_ZH_XIN); /* 心 */
-    OLED_ShowCHinese((u8)(OLED_VALUE_LABEL_X + 16U), 4U, OLED_ZH_LV); /* 率 */
+    OLED_UpdateVitalsLabels();
     break;
 
   case OLED_PANEL_NO_DATA:
@@ -1015,6 +1070,8 @@ static void OLED_UpdateVitalsText(void)
     return;
   }
 
+  OLED_UpdateVitalsLabels();
+
   if (br < 0)
   {
     br = 0;
@@ -1080,6 +1137,10 @@ static void OLED_Service(void)
 {
   uint32_t now;
   OLED_WaveMode target_wave_mode;
+  OLED_RightPanelMode panel_mode;
+  bool breath_low;
+  bool heart_low;
+  bool any_low;
 
   if (!s_oled_ready)
   {
@@ -1113,6 +1174,43 @@ static void OLED_Service(void)
     OLED_UpdateVitalsText();
     s_last_oled_text_tick = now;
     s_oled_rate_dirty = false;
+  }
+
+  panel_mode = OLED_GetPanelMode();
+  if (panel_mode == OLED_PANEL_VITALS)
+  {
+    breath_low = (s_latest_breath_rate >= 0.0f) && (s_latest_breath_rate < OLED_BREATH_LOW_THRESHOLD);
+    heart_low = (s_latest_heart_rate >= 0.0f) && (s_latest_heart_rate < OLED_HEART_LOW_THRESHOLD);
+    any_low = breath_low || heart_low;
+
+    if (any_low)
+    {
+      if ((now - s_last_oled_low_label_blink_tick) >= OLED_LOW_LABEL_BLINK_MS)
+      {
+        s_last_oled_low_label_blink_tick = now;
+        s_oled_low_label_visible = !s_oled_low_label_visible;
+        OLED_UpdateVitalsText();
+        s_last_oled_text_tick = now;
+        s_oled_rate_dirty = false;
+      }
+    }
+    else
+    {
+      if (!s_oled_low_label_visible)
+      {
+        s_oled_low_label_visible = true;
+        OLED_UpdateVitalsText();
+        s_last_oled_text_tick = now;
+        s_oled_rate_dirty = false;
+      }
+
+      s_last_oled_low_label_blink_tick = now;
+    }
+  }
+  else
+  {
+    s_oled_low_label_visible = true;
+    s_last_oled_low_label_blink_tick = now;
   }
 
   if (s_oled_wave_pending && ((now - s_last_oled_wave_tick) >= OLED_WAVE_UPDATE_MS))
@@ -1151,6 +1249,11 @@ static void OLED_UI_Init(void)
   s_latest_heart_rate = 0.0f;
   s_last_radar_frame_tick = HAL_GetTick();
   s_radar_data_online = false;
+  s_oled_low_label_visible = true;
+  s_last_oled_low_label_blink_tick = HAL_GetTick();
+  s_oled_label_state_valid = false;
+  s_oled_breath_label_drawn = false;
+  s_oled_heart_label_drawn = false;
   s_human_detect_valid = false;
   s_human_present = false;
   s_human_candidate_present = false;
