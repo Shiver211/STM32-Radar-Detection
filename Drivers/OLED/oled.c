@@ -12,6 +12,51 @@ extern I2C_HandleTypeDef hi2c1;
 
 static I2C_HandleTypeDef *s_oled_i2c = &hi2c1;
 static uint8_t s_oled_gram[OLED_PAGE_COUNT][X_WIDTH];
+static uint8_t s_dirty_valid;
+static uint8_t s_dirty_x_min;
+static uint8_t s_dirty_x_max;
+static uint8_t s_dirty_page_min;
+static uint8_t s_dirty_page_max;
+
+static void OLED_DirtyReset(void)
+{
+  s_dirty_valid = 0U;
+  s_dirty_x_min = 0U;
+  s_dirty_x_max = 0U;
+  s_dirty_page_min = 0U;
+  s_dirty_page_max = 0U;
+}
+
+static void OLED_MarkDirty(uint8_t x, uint8_t page)
+{
+  if (s_dirty_valid == 0U)
+  {
+    s_dirty_valid = 1U;
+    s_dirty_x_min = x;
+    s_dirty_x_max = x;
+    s_dirty_page_min = page;
+    s_dirty_page_max = page;
+    return;
+  }
+
+  if (x < s_dirty_x_min)
+  {
+    s_dirty_x_min = x;
+  }
+  else if (x > s_dirty_x_max)
+  {
+    s_dirty_x_max = x;
+  }
+
+  if (page < s_dirty_page_min)
+  {
+    s_dirty_page_min = page;
+  }
+  else if (page > s_dirty_page_max)
+  {
+    s_dirty_page_max = page;
+  }
+}
 
 static void OLED_WriteCommand(uint8_t cmd)
 {
@@ -116,6 +161,8 @@ void fill_picture(unsigned char fill_Data)
     memset(s_oled_gram[page], fill_Data, X_WIDTH);
     OLED_UpdateArea(0U, page, s_oled_gram[page], X_WIDTH);
   }
+
+  OLED_DirtyReset();
 }
 
 void OLED_Clear(void)
@@ -145,7 +192,26 @@ void OLED_DrawPoint(u8 x, u8 y, u8 t)
     s_oled_gram[page][x] &= (uint8_t)(~bit_mask);
   }
 
-  OLED_UpdateArea(x, page, &s_oled_gram[page][x], 1U);
+  OLED_MarkDirty(x, page);
+}
+
+void OLED_RefreshDirty(void)
+{
+  uint8_t page;
+  uint8_t len;
+
+  if (s_dirty_valid == 0U)
+  {
+    return;
+  }
+
+  len = (uint8_t)(s_dirty_x_max - s_dirty_x_min + 1U);
+  for (page = s_dirty_page_min; page <= s_dirty_page_max; ++page)
+  {
+    OLED_UpdateArea(s_dirty_x_min, page, &s_oled_gram[page][s_dirty_x_min], len);
+  }
+
+  OLED_DirtyReset();
 }
 
 void OLED_Fill(u8 x1, u8 y1, u8 x2, u8 y2, u8 dot)
@@ -165,6 +231,8 @@ void OLED_Fill(u8 x1, u8 y1, u8 x2, u8 y2, u8 dot)
       OLED_DrawPoint(x, y, dot);
     }
   }
+
+  OLED_RefreshDirty();
 }
 
 void OLED_ShowChar(u8 x, u8 y, u8 chr, u8 Char_Size)
@@ -355,5 +423,6 @@ void OLED_Init(void)
     OLED_WriteCommand(init_cmds[i]);
   }
 
+  OLED_DirtyReset();
   OLED_Clear();
 }

@@ -63,21 +63,54 @@ typedef struct
   LD6002_Frame frame;
 } LD6002_Parser;
 
+typedef enum
+{
+  OLED_PANEL_VITALS = 0,
+  OLED_PANEL_NO_DATA,
+  OLED_PANEL_NO_HUMAN,
+  OLED_PANEL_DIST_TOO_FAR,
+  OLED_PANEL_DIST_TOO_NEAR,
+  OLED_PANEL_MODE_COUNT
+} OLED_RightPanelMode;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define LD6002_SOF 0x01U
 #define LD6002_MAX_PAYLOAD_LEN 128U
-#define LD6002_FRAME_QUEUE_SIZE 8U
+#define LD6002_FRAME_QUEUE_SIZE 16U
 #define LD6002_UART_TIMEOUT_MS 50U
+#define LD6002_NO_DATA_TIMEOUT_MS 1000U
+#define LD6002_TARGET_RANGE_MIN_CM 25.0f
+#define LD6002_TARGET_RANGE_MAX_CM 100.0f
 
 #define OLED_WAVE_X_START 0U
 #define OLED_WAVE_X_END   95U
 #define OLED_WAVE_WIDTH   ((OLED_WAVE_X_END - OLED_WAVE_X_START) + 1U)
 
-#define OLED_VALUE_LABEL_X 96U
+#define OLED_VALUE_AREA_X_START 96U
+#define OLED_VALUE_AREA_X_END   127U
+#define OLED_VALUE_AREA_WIDTH   ((OLED_VALUE_AREA_X_END - OLED_VALUE_AREA_X_START) + 1U)
+
+#define OLED_VALUE_LABEL_X OLED_VALUE_AREA_X_START
 #define OLED_VALUE_DATA_X  100U
+
+#define OLED_TEXT_2CHAR_X (OLED_VALUE_AREA_X_START + ((OLED_VALUE_AREA_WIDTH - 16U) / 2U))
+#define OLED_TEXT_3CHAR_X (OLED_VALUE_AREA_X_START + ((OLED_VALUE_AREA_WIDTH - 24U) / 2U))
+#define OLED_TEXT_4CHAR_X (OLED_VALUE_AREA_X_START + ((OLED_VALUE_AREA_WIDTH - 32U) / 2U))
+
+#define OLED_TEXT_LINE1_Y 2U
+#define OLED_TEXT_LINE2_Y 5U
+
+#define OLED_ZH_XIN 0U
+#define OLED_ZH_LV  1U
+#define OLED_ZH_HU  2U
+#define OLED_ZH_XI  3U
+#define OLED_ZH_WU  4U
+#define OLED_ZH_REN 5U
+#define OLED_ZH_CUO 10U
+#define OLED_ZH_WU2 11U
 
 #define OLED_BREATH_Y_MIN    1U
 #define OLED_BREATH_Y_MAX    30U
@@ -136,6 +169,14 @@ static float s_pending_breath_phase;
 static float s_pending_heart_phase;
 static uint32_t s_last_oled_wave_tick;
 static uint32_t s_last_oled_text_tick;
+static uint32_t s_last_radar_frame_tick;
+static bool s_radar_data_online;
+static bool s_human_detect_valid;
+static bool s_human_present;
+static bool s_target_range_valid;
+static float s_target_range_cm;
+static bool s_oled_axes_only_mode;
+static OLED_RightPanelMode s_oled_panel_drawn_mode;
 
 /* USER CODE END PV */
 
@@ -162,6 +203,11 @@ static void LD6002_ProcessFrames(void);
 static void LD6002_ReportStats(void);
 static uint8_t OLED_MapPhaseToY(float value, uint8_t center_y, float gain, uint8_t y_min, uint8_t y_max);
 static void OLED_DrawLine(uint8_t x0, uint8_t y0, uint8_t x1, uint8_t y1);
+static void OLED_DrawWaveAxes(void);
+static void OLED_ClearWaveAndKeepAxes(void);
+static bool OLED_ShouldAxesOnly(void);
+static OLED_RightPanelMode OLED_GetPanelMode(void);
+static void OLED_DrawPanelMode(OLED_RightPanelMode mode);
 static void OLED_PlotWaveColumn(float breath_phase, float heart_phase);
 static void OLED_UpdateVitalsText(void);
 static void OLED_SetBreathRate(float rate);
@@ -432,6 +478,122 @@ static void OLED_DrawLine(uint8_t x0, uint8_t y0, uint8_t x1, uint8_t y1)
   }
 }
 
+static void OLED_DrawWaveAxes(void)
+{
+  uint8_t x;
+
+  for (x = OLED_WAVE_X_START; x <= OLED_WAVE_X_END; x++)
+  {
+    if ((x & 0x01U) == 0U)
+    {
+      OLED_DrawPoint(x, OLED_WAVE_SPLIT_Y, 1U);
+    }
+
+    OLED_DrawPoint(x, OLED_BREATH_CENTER_Y, 1U);
+    OLED_DrawPoint(x, OLED_HEART_CENTER_Y, 1U);
+  }
+}
+
+static void OLED_ClearWaveAndKeepAxes(void)
+{
+  uint8_t x;
+  uint8_t y;
+
+  for (x = OLED_WAVE_X_START; x <= OLED_WAVE_X_END; x++)
+  {
+    for (y = OLED_BREATH_Y_MIN; y <= OLED_HEART_Y_MAX; y++)
+    {
+      OLED_DrawPoint(x, y, 0U);
+    }
+  }
+
+  OLED_DrawWaveAxes();
+  OLED_RefreshDirty();
+}
+
+static bool OLED_ShouldAxesOnly(void)
+{
+  if (!s_radar_data_online)
+  {
+    return true;
+  }
+
+  if (s_human_detect_valid && !s_human_present)
+  {
+    return true;
+  }
+
+  return false;
+}
+
+static OLED_RightPanelMode OLED_GetPanelMode(void)
+{
+  if (!s_radar_data_online)
+  {
+    return OLED_PANEL_NO_DATA;
+  }
+
+  if (s_human_detect_valid && !s_human_present)
+  {
+    return OLED_PANEL_NO_HUMAN;
+  }
+
+  if (s_target_range_valid)
+  {
+    if (s_target_range_cm > LD6002_TARGET_RANGE_MAX_CM)
+    {
+      return OLED_PANEL_DIST_TOO_FAR;
+    }
+
+    if (s_target_range_cm < LD6002_TARGET_RANGE_MIN_CM)
+    {
+      return OLED_PANEL_DIST_TOO_NEAR;
+    }
+  }
+
+  return OLED_PANEL_VITALS;
+}
+
+static void OLED_DrawPanelMode(OLED_RightPanelMode mode)
+{
+  OLED_Fill(OLED_VALUE_AREA_X_START, 0U, OLED_VALUE_AREA_X_END, 63U, 0U);
+
+  switch (mode)
+  {
+  case OLED_PANEL_VITALS:
+    OLED_ShowCHinese(OLED_VALUE_LABEL_X, 0U, OLED_ZH_HU); /* 呼 */
+    OLED_ShowCHinese((u8)(OLED_VALUE_LABEL_X + 16U), 0U, OLED_ZH_XI); /* 吸 */
+    OLED_ShowCHinese(OLED_VALUE_LABEL_X, 4U, OLED_ZH_XIN); /* 心 */
+    OLED_ShowCHinese((u8)(OLED_VALUE_LABEL_X + 16U), 4U, OLED_ZH_LV); /* 率 */
+    break;
+
+  case OLED_PANEL_NO_DATA:
+    OLED_ShowString(OLED_TEXT_2CHAR_X, OLED_TEXT_LINE1_Y, (u8 *)"No", 8U);
+    OLED_ShowString(OLED_TEXT_4CHAR_X, OLED_TEXT_LINE2_Y, (u8 *)"Data", 8U);
+    break;
+
+  case OLED_PANEL_NO_HUMAN:
+    OLED_ShowCHinese(OLED_VALUE_LABEL_X, 0U, OLED_ZH_CUO); /* 错 */
+    OLED_ShowCHinese((u8)(OLED_VALUE_LABEL_X + 16U), 0U, OLED_ZH_WU2); /* 误 */
+    OLED_ShowCHinese(OLED_VALUE_LABEL_X, 4U, OLED_ZH_WU); /* 无 */
+    OLED_ShowCHinese((u8)(OLED_VALUE_LABEL_X + 16U), 4U, OLED_ZH_REN); /* 人 */
+    break;
+
+  case OLED_PANEL_DIST_TOO_FAR:
+    OLED_ShowString(OLED_TEXT_3CHAR_X, OLED_TEXT_LINE1_Y, (u8 *)"Too", 8U);
+    OLED_ShowString(OLED_TEXT_3CHAR_X, OLED_TEXT_LINE2_Y, (u8 *)"Far", 8U);
+    break;
+
+  case OLED_PANEL_DIST_TOO_NEAR:
+    OLED_ShowString(OLED_TEXT_3CHAR_X, OLED_TEXT_LINE1_Y, (u8 *)"Too", 8U);
+    OLED_ShowString(OLED_TEXT_4CHAR_X, OLED_TEXT_LINE2_Y, (u8 *)"Near", 8U);
+    break;
+
+  default:
+    break;
+  }
+}
+
 static void OLED_PlotWaveColumn(float breath_phase, float heart_phase)
 {
   uint8_t x = (uint8_t)(OLED_WAVE_X_START + s_oled_wave_x);
@@ -485,16 +647,31 @@ static void OLED_PlotWaveColumn(float breath_phase, float heart_phase)
     s_oled_wave_x = 0U;
     s_oled_wave_prev_valid = false;
   }
+
+  OLED_RefreshDirty();
 }
 
 static void OLED_UpdateVitalsText(void)
 {
+  OLED_RightPanelMode panel_mode;
   int32_t br = (int32_t)(s_latest_breath_rate + ((s_latest_breath_rate >= 0.0f) ? 0.5f : -0.5f));
   int32_t hr = (int32_t)(s_latest_heart_rate + ((s_latest_heart_rate >= 0.0f) ? 0.5f : -0.5f));
   uint16_t br_u;
   uint16_t hr_u;
   char br_text[8];
   char hr_text[8];
+
+  panel_mode = OLED_GetPanelMode();
+  if (panel_mode != s_oled_panel_drawn_mode)
+  {
+    OLED_DrawPanelMode(panel_mode);
+    s_oled_panel_drawn_mode = panel_mode;
+  }
+
+  if (panel_mode != OLED_PANEL_VITALS)
+  {
+    return;
+  }
 
   if (br < 0)
   {
@@ -519,8 +696,8 @@ static void OLED_UpdateVitalsText(void)
   br_u = (uint16_t)br;
   hr_u = (uint16_t)hr;
 
-  (void)snprintf(br_text, sizeof(br_text), "%03u", br_u);
-  (void)snprintf(hr_text, sizeof(hr_text), "%03u", hr_u);
+  (void)snprintf(br_text, sizeof(br_text), "%03u ", br_u);
+  (void)snprintf(hr_text, sizeof(hr_text), "%03u ", hr_u);
 
   OLED_ShowString(OLED_VALUE_DATA_X, 2U, (u8 *)br_text, 8U);
   OLED_ShowString(OLED_VALUE_DATA_X, 6U, (u8 *)hr_text, 8U);
@@ -548,6 +725,7 @@ static void OLED_SetPhases(float breath_phase, float heart_phase)
 static void OLED_Service(void)
 {
   uint32_t now;
+  bool should_axes_only;
 
   if (!s_oled_ready)
   {
@@ -556,9 +734,42 @@ static void OLED_Service(void)
 
   now = HAL_GetTick();
 
+  if (s_radar_data_online && ((now - s_last_radar_frame_tick) >= LD6002_NO_DATA_TIMEOUT_MS))
+  {
+    s_radar_data_online = false;
+    s_human_detect_valid = false;
+    s_target_range_valid = false;
+    s_oled_rate_dirty = true;
+  }
+
+  should_axes_only = OLED_ShouldAxesOnly();
+  if (should_axes_only && !s_oled_axes_only_mode)
+  {
+    s_oled_axes_only_mode = true;
+    s_oled_wave_pending = false;
+    s_oled_wave_prev_valid = false;
+    s_oled_wave_x = 0U;
+    OLED_ClearWaveAndKeepAxes();
+    OLED_UpdateVitalsText();
+    s_last_oled_text_tick = now;
+    s_oled_rate_dirty = false;
+  }
+  else if (!should_axes_only && s_oled_axes_only_mode)
+  {
+    s_oled_axes_only_mode = false;
+    s_oled_wave_prev_valid = false;
+    OLED_UpdateVitalsText();
+    s_last_oled_text_tick = now;
+    s_oled_rate_dirty = false;
+  }
+
   if (s_oled_wave_pending && ((now - s_last_oled_wave_tick) >= OLED_WAVE_UPDATE_MS))
   {
-    OLED_PlotWaveColumn(s_pending_breath_phase, s_pending_heart_phase);
+    if (!s_oled_axes_only_mode)
+    {
+      OLED_PlotWaveColumn(s_pending_breath_phase, s_pending_heart_phase);
+    }
+
     s_last_oled_wave_tick = now;
     s_oled_wave_pending = false;
   }
@@ -573,34 +784,25 @@ static void OLED_Service(void)
 
 static void OLED_UI_Init(void)
 {
-  uint8_t x;
-
   OLED_Init();
   OLED_Clear();
 
-  for (x = OLED_WAVE_X_START; x <= OLED_WAVE_X_END; x++)
-  {
-    if ((x & 0x01U) == 0U)
-    {
-      OLED_DrawPoint(x, OLED_WAVE_SPLIT_Y, 1U);
-    }
-  }
+  OLED_DrawWaveAxes();
 
-  for (x = OLED_WAVE_X_START; x <= OLED_WAVE_X_END; x++)
-  {
-    OLED_DrawPoint(x, OLED_BREATH_CENTER_Y, 1U);
-    OLED_DrawPoint(x, OLED_HEART_CENTER_Y, 1U);
-  }
-
-  OLED_ShowCHinese(OLED_VALUE_LABEL_X, 0U, 16U); /* 呼 */
-  OLED_ShowCHinese((u8)(OLED_VALUE_LABEL_X + 16U), 0U, 17U); /* 吸 */
-  OLED_ShowCHinese(OLED_VALUE_LABEL_X, 4U, 14U); /* 心 */
-  OLED_ShowCHinese((u8)(OLED_VALUE_LABEL_X + 16U), 4U, 15U); /* 率 */
+  OLED_RefreshDirty();
 
   s_oled_wave_x = 0U;
   s_oled_wave_prev_valid = false;
   s_latest_breath_rate = 0.0f;
   s_latest_heart_rate = 0.0f;
+  s_last_radar_frame_tick = HAL_GetTick();
+  s_radar_data_online = false;
+  s_human_detect_valid = false;
+  s_human_present = false;
+  s_target_range_valid = false;
+  s_target_range_cm = 0.0f;
+  s_oled_axes_only_mode = true;
+  s_oled_panel_drawn_mode = OLED_PANEL_MODE_COUNT;
   s_oled_rate_dirty = true;
   s_oled_wave_pending = false;
   s_oled_ready = true;
@@ -643,6 +845,16 @@ static void LD6002_LogFrame(const LD6002_Frame *frame)
     if (frame->len >= 2U)
     {
       uint16_t is_human = (uint16_t)frame->data[0] | ((uint16_t)frame->data[1] << 8);
+      bool human_present = (is_human != 0U);
+
+      if ((!s_human_detect_valid) || (s_human_present != human_present))
+      {
+        s_oled_rate_dirty = true;
+      }
+
+      s_human_detect_valid = true;
+      s_human_present = human_present;
+
       UART1_Sendf("[RADAR] TYPE=0x0F09 ID=0x%04X Human=%u\r\n", frame->id, (unsigned)is_human);
     }
     break;
@@ -686,6 +898,11 @@ static void LD6002_LogFrame(const LD6002_Frame *frame)
     {
       uint32_t flag = LD6002_U32Le(&frame->data[0]);
       float range = LD6002_F32Le(&frame->data[4]);
+
+      s_target_range_cm = range;
+      s_target_range_valid = true;
+      s_oled_rate_dirty = true;
+
       LD6002_FormatFloat(range, a, sizeof(a));
       UART1_Sendf("[RADAR] TYPE=0x0A16 ID=0x%04X Flag=%lu Range=%s cm\r\n", frame->id, (unsigned long)flag, a);
     }
@@ -702,6 +919,13 @@ static void LD6002_ProcessFrames(void)
 
   while (LD6002_QueuePop(&frame))
   {
+    s_last_radar_frame_tick = HAL_GetTick();
+    if (!s_radar_data_online)
+    {
+      s_radar_data_online = true;
+      s_oled_rate_dirty = true;
+    }
+
     LD6002_LogFrame(&frame);
   }
 }
@@ -979,6 +1203,7 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
   if (huart->Instance == USART2)
   {
+    LD6002_ParserReset(&s_ld6002_parser);
     (void)HAL_UART_Receive_IT(&huart2, &s_uart2_rx_byte, 1U);
   }
 }
