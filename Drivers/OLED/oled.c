@@ -8,7 +8,7 @@ extern I2C_HandleTypeDef hi2c1;
 #define OLED_I2C_ADDR      (0x3CU << 1)
 #define OLED_PAGE_COUNT    8U
 #define OLED_DATA_CHUNK    16U
-#define OLED_COLUMN_OFFSET 2U
+#define OLED_COLUMN_OFFSET 2U  // SH1106 typically uses offset 2
 
 static I2C_HandleTypeDef *s_oled_i2c = &hi2c1;
 static uint8_t s_oled_gram[OLED_PAGE_COUNT][X_WIDTH];
