@@ -21,6 +21,8 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "oled.h"
+
 #include <stdbool.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -70,6 +72,28 @@ typedef struct
 #define LD6002_FRAME_QUEUE_SIZE 8U
 #define LD6002_UART_TIMEOUT_MS 50U
 
+#define OLED_WAVE_X_START 0U
+#define OLED_WAVE_X_END   95U
+#define OLED_WAVE_WIDTH   ((OLED_WAVE_X_END - OLED_WAVE_X_START) + 1U)
+
+#define OLED_VALUE_LABEL_X 96U
+#define OLED_VALUE_DATA_X  100U
+
+#define OLED_BREATH_Y_MIN    1U
+#define OLED_BREATH_Y_MAX    30U
+#define OLED_BREATH_CENTER_Y 15U
+#define OLED_BREATH_GAIN     22.0f
+
+#define OLED_HEART_Y_MIN    33U
+#define OLED_HEART_Y_MAX    62U
+#define OLED_HEART_CENTER_Y 47U
+#define OLED_HEART_GAIN     18.0f
+
+#define OLED_WAVE_SPLIT_Y 31U
+
+#define OLED_WAVE_UPDATE_MS 50U
+#define OLED_TEXT_UPDATE_MS 200U
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -99,6 +123,20 @@ static uint32_t s_last_cksum_report;
 static uint32_t s_last_len_report;
 static uint32_t s_last_sof_report;
 
+static bool s_oled_ready;
+static bool s_oled_rate_dirty;
+static bool s_oled_wave_pending;
+static bool s_oled_wave_prev_valid;
+static uint8_t s_oled_wave_x;
+static uint8_t s_prev_breath_y;
+static uint8_t s_prev_heart_y;
+static float s_latest_breath_rate;
+static float s_latest_heart_rate;
+static float s_pending_breath_phase;
+static float s_pending_heart_phase;
+static uint32_t s_last_oled_wave_tick;
+static uint32_t s_last_oled_text_tick;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -122,6 +160,15 @@ static void UART1_Sendf(const char *fmt, ...);
 static void LD6002_LogFrame(const LD6002_Frame *frame);
 static void LD6002_ProcessFrames(void);
 static void LD6002_ReportStats(void);
+static uint8_t OLED_MapPhaseToY(float value, uint8_t center_y, float gain, uint8_t y_min, uint8_t y_max);
+static void OLED_DrawLine(uint8_t x0, uint8_t y0, uint8_t x1, uint8_t y1);
+static void OLED_PlotWaveColumn(float breath_phase, float heart_phase);
+static void OLED_UpdateVitalsText(void);
+static void OLED_SetBreathRate(float rate);
+static void OLED_SetHeartRate(float rate);
+static void OLED_SetPhases(float breath_phase, float heart_phase);
+static void OLED_Service(void);
+static void OLED_UI_Init(void);
 
 /* USER CODE END PFP */
 
@@ -333,6 +380,233 @@ static void LD6002_FormatFloat(float value, char *out, size_t out_size)
   }
 }
 
+static uint8_t OLED_MapPhaseToY(float value, uint8_t center_y, float gain, uint8_t y_min, uint8_t y_max)
+{
+  int32_t y = (int32_t)center_y - (int32_t)(value * gain);
+
+  if (y < (int32_t)y_min)
+  {
+    y = (int32_t)y_min;
+  }
+  else if (y > (int32_t)y_max)
+  {
+    y = (int32_t)y_max;
+  }
+
+  return (uint8_t)y;
+}
+
+static void OLED_DrawLine(uint8_t x0, uint8_t y0, uint8_t x1, uint8_t y1)
+{
+  int16_t dx = (int16_t)x1 - (int16_t)x0;
+  int16_t dy = (int16_t)y1 - (int16_t)y0;
+  int16_t sx = (dx >= 0) ? 1 : -1;
+  int16_t sy = (dy >= 0) ? 1 : -1;
+  int16_t abs_dx = (dx >= 0) ? dx : (int16_t)-dx;
+  int16_t abs_dy = (dy >= 0) ? dy : (int16_t)-dy;
+  int16_t err = abs_dx - abs_dy;
+  int16_t e2;
+
+  while (1)
+  {
+    OLED_DrawPoint((u8)x0, (u8)y0, 1U);
+
+    if ((x0 == x1) && (y0 == y1))
+    {
+      break;
+    }
+
+    e2 = (int16_t)(2 * err);
+
+    if (e2 > -abs_dy)
+    {
+      err = (int16_t)(err - abs_dy);
+      x0 = (uint8_t)((int16_t)x0 + sx);
+    }
+
+    if (e2 < abs_dx)
+    {
+      err = (int16_t)(err + abs_dx);
+      y0 = (uint8_t)((int16_t)y0 + sy);
+    }
+  }
+}
+
+static void OLED_PlotWaveColumn(float breath_phase, float heart_phase)
+{
+  uint8_t x = (uint8_t)(OLED_WAVE_X_START + s_oled_wave_x);
+  uint8_t y;
+  uint8_t breath_y;
+  uint8_t heart_y;
+
+  for (y = OLED_BREATH_Y_MIN; y <= OLED_BREATH_Y_MAX; y++)
+  {
+    OLED_DrawPoint(x, y, 0U);
+  }
+
+  for (y = OLED_HEART_Y_MIN; y <= OLED_HEART_Y_MAX; y++)
+  {
+    OLED_DrawPoint(x, y, 0U);
+  }
+
+  OLED_DrawPoint(x, OLED_BREATH_CENTER_Y, 1U);
+  OLED_DrawPoint(x, OLED_HEART_CENTER_Y, 1U);
+
+  breath_y = OLED_MapPhaseToY(breath_phase,
+                              OLED_BREATH_CENTER_Y,
+                              OLED_BREATH_GAIN,
+                              OLED_BREATH_Y_MIN,
+                              OLED_BREATH_Y_MAX);
+
+  heart_y = OLED_MapPhaseToY(heart_phase,
+                             OLED_HEART_CENTER_Y,
+                             OLED_HEART_GAIN,
+                             OLED_HEART_Y_MIN,
+                             OLED_HEART_Y_MAX);
+
+  if (s_oled_wave_prev_valid && (s_oled_wave_x > 0U))
+  {
+    OLED_DrawLine((uint8_t)(x - 1U), s_prev_breath_y, x, breath_y);
+    OLED_DrawLine((uint8_t)(x - 1U), s_prev_heart_y, x, heart_y);
+  }
+  else
+  {
+    OLED_DrawPoint(x, breath_y, 1U);
+    OLED_DrawPoint(x, heart_y, 1U);
+  }
+
+  s_prev_breath_y = breath_y;
+  s_prev_heart_y = heart_y;
+  s_oled_wave_prev_valid = true;
+  s_oled_wave_x++;
+
+  if (s_oled_wave_x >= OLED_WAVE_WIDTH)
+  {
+    s_oled_wave_x = 0U;
+    s_oled_wave_prev_valid = false;
+  }
+}
+
+static void OLED_UpdateVitalsText(void)
+{
+  int32_t br = (int32_t)(s_latest_breath_rate + ((s_latest_breath_rate >= 0.0f) ? 0.5f : -0.5f));
+  int32_t hr = (int32_t)(s_latest_heart_rate + ((s_latest_heart_rate >= 0.0f) ? 0.5f : -0.5f));
+  uint16_t br_u;
+  uint16_t hr_u;
+  char br_text[8];
+  char hr_text[8];
+
+  if (br < 0)
+  {
+    br = 0;
+  }
+
+  if (hr < 0)
+  {
+    hr = 0;
+  }
+
+  if (br > 999)
+  {
+    br = 999;
+  }
+
+  if (hr > 999)
+  {
+    hr = 999;
+  }
+
+  br_u = (uint16_t)br;
+  hr_u = (uint16_t)hr;
+
+  (void)snprintf(br_text, sizeof(br_text), "%03u", br_u);
+  (void)snprintf(hr_text, sizeof(hr_text), "%03u", hr_u);
+
+  OLED_ShowString(OLED_VALUE_DATA_X, 2U, (u8 *)br_text, 8U);
+  OLED_ShowString(OLED_VALUE_DATA_X, 6U, (u8 *)hr_text, 8U);
+}
+
+static void OLED_SetBreathRate(float rate)
+{
+  s_latest_breath_rate = rate;
+  s_oled_rate_dirty = true;
+}
+
+static void OLED_SetHeartRate(float rate)
+{
+  s_latest_heart_rate = rate;
+  s_oled_rate_dirty = true;
+}
+
+static void OLED_SetPhases(float breath_phase, float heart_phase)
+{
+  s_pending_breath_phase = breath_phase;
+  s_pending_heart_phase = heart_phase;
+  s_oled_wave_pending = true;
+}
+
+static void OLED_Service(void)
+{
+  uint32_t now;
+
+  if (!s_oled_ready)
+  {
+    return;
+  }
+
+  now = HAL_GetTick();
+
+  if (s_oled_wave_pending && ((now - s_last_oled_wave_tick) >= OLED_WAVE_UPDATE_MS))
+  {
+    OLED_PlotWaveColumn(s_pending_breath_phase, s_pending_heart_phase);
+    s_last_oled_wave_tick = now;
+    s_oled_wave_pending = false;
+  }
+
+  if (s_oled_rate_dirty && ((now - s_last_oled_text_tick) >= OLED_TEXT_UPDATE_MS))
+  {
+    OLED_UpdateVitalsText();
+    s_last_oled_text_tick = now;
+    s_oled_rate_dirty = false;
+  }
+}
+
+static void OLED_UI_Init(void)
+{
+  uint8_t x;
+
+  OLED_Init();
+  OLED_Clear();
+
+  for (x = OLED_WAVE_X_START; x <= OLED_WAVE_X_END; x++)
+  {
+    if ((x & 0x01U) == 0U)
+    {
+      OLED_DrawPoint(x, OLED_WAVE_SPLIT_Y, 1U);
+    }
+  }
+
+  for (x = OLED_WAVE_X_START; x <= OLED_WAVE_X_END; x++)
+  {
+    OLED_DrawPoint(x, OLED_BREATH_CENTER_Y, 1U);
+    OLED_DrawPoint(x, OLED_HEART_CENTER_Y, 1U);
+  }
+
+  OLED_ShowCHinese(OLED_VALUE_LABEL_X, 0U, 16U); /* 呼 */
+  OLED_ShowCHinese((u8)(OLED_VALUE_LABEL_X + 16U), 0U, 17U); /* 吸 */
+  OLED_ShowCHinese(OLED_VALUE_LABEL_X, 4U, 14U); /* 心 */
+  OLED_ShowCHinese((u8)(OLED_VALUE_LABEL_X + 16U), 4U, 15U); /* 率 */
+
+  s_oled_wave_x = 0U;
+  s_oled_wave_prev_valid = false;
+  s_latest_breath_rate = 0.0f;
+  s_latest_heart_rate = 0.0f;
+  s_oled_rate_dirty = true;
+  s_oled_wave_pending = false;
+  s_oled_ready = true;
+  OLED_UpdateVitalsText();
+}
+
 static void UART1_SendText(const char *text)
 {
   size_t len = strlen(text);
@@ -362,11 +636,6 @@ static void UART1_Sendf(const char *fmt, ...)
 static void LD6002_LogFrame(const LD6002_Frame *frame)
 {
   char a[20];
-  char b[20];
-  char c[20];
-  uint16_t i;
-  char hex_buf[96];
-  int pos = 0;
 
   switch (frame->type)
   {
@@ -381,17 +650,10 @@ static void LD6002_LogFrame(const LD6002_Frame *frame)
   case 0x0A13:
     if (frame->len >= 12U)
     {
-      float total_phase = LD6002_F32Le(&frame->data[0]);
       float breath_phase = LD6002_F32Le(&frame->data[4]);
       float heart_phase = LD6002_F32Le(&frame->data[8]);
-      LD6002_FormatFloat(total_phase, a, sizeof(a));
-      LD6002_FormatFloat(breath_phase, b, sizeof(b));
-      LD6002_FormatFloat(heart_phase, c, sizeof(c));
-      UART1_Sendf("[RADAR] TYPE=0x0A13 ID=0x%04X Total=%s Breath=%s Heart=%s\r\n", frame->id, a, b, c);
-    }
-    else
-    {
-      UART1_Sendf("[RADAR] TYPE=0x0A13 LEN_ERR len=%u\r\n", frame->len);
+
+      OLED_SetPhases(breath_phase, heart_phase);
     }
     break;
 
@@ -399,6 +661,9 @@ static void LD6002_LogFrame(const LD6002_Frame *frame)
     if (frame->len >= 4U)
     {
       float breath_rate = LD6002_F32Le(&frame->data[0]);
+
+      OLED_SetBreathRate(breath_rate);
+
       LD6002_FormatFloat(breath_rate, a, sizeof(a));
       UART1_Sendf("[RADAR] TYPE=0x0A14 ID=0x%04X BreathRate=%s bpm\r\n", frame->id, a);
     }
@@ -408,6 +673,9 @@ static void LD6002_LogFrame(const LD6002_Frame *frame)
     if (frame->len >= 4U)
     {
       float heart_rate = LD6002_F32Le(&frame->data[0]);
+
+      OLED_SetHeartRate(heart_rate);
+
       LD6002_FormatFloat(heart_rate, a, sizeof(a));
       UART1_Sendf("[RADAR] TYPE=0x0A15 ID=0x%04X HeartRate=%s bpm\r\n", frame->id, a);
     }
@@ -424,19 +692,6 @@ static void LD6002_LogFrame(const LD6002_Frame *frame)
     break;
 
   default:
-    for (i = 0U; (i < frame->len) && (i < 20U); i++)
-    {
-      pos += snprintf(&hex_buf[pos], sizeof(hex_buf) - (size_t)pos, "%02X ", frame->data[i]);
-      if (pos >= (int)(sizeof(hex_buf) - 4U))
-      {
-        break;
-      }
-    }
-    UART1_Sendf("[RADAR] TYPE=0x%04X ID=0x%04X LEN=%u DATA=%s\r\n",
-                frame->type,
-                frame->id,
-                frame->len,
-                (pos > 0) ? hex_buf : "");
     break;
   }
 }
@@ -516,8 +771,10 @@ int main(void)
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
   LD6002_ParserReset(&s_ld6002_parser);
+  OLED_UI_Init();
   LD6002_StartUart2Rx();
   UART1_SendText("\r\n[RADAR] UART2->TF parser started\r\n");
+  UART1_SendText("[RADAR] OLED wave+vitals ready\r\n");
 
   /* USER CODE END 2 */
 
@@ -529,6 +786,7 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     LD6002_ProcessFrames();
+    OLED_Service();
     LD6002_ReportStats();
   }
   /* USER CODE END 3 */
