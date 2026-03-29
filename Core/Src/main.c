@@ -119,8 +119,8 @@ typedef enum
 #define LD6002_TARGET_RANGE_MAX_CM 100.0f
 #define LD6002_TARGET_RANGE_NEAR_RELEASE_CM 36.0f
 #define LD6002_TARGET_RANGE_FAR_RELEASE_CM 99.0f
-#define LD6002_TARGET_RANGE_NEAR_FAST_RELEASE_CM 38.0f
-#define LD6002_TARGET_RANGE_FAR_FAST_RELEASE_CM 97.0f
+#define LD6002_TARGET_RANGE_NEAR_FAST_RELEASE_CM 36.0f
+#define LD6002_TARGET_RANGE_FAR_FAST_RELEASE_CM 99.0f
 #define LD6002_RANGE_FILTER_ALPHA 0.75f
 
 /* 左侧波形区几何范围（x=0..95）。 */
@@ -174,6 +174,9 @@ typedef enum
 #define OLED_WAVE_UPDATE_MS 50U
 #define OLED_TEXT_UPDATE_MS 200U
 
+/* UART1 汇总信息发送周期（ms）。 */
+#define UART1_SUMMARY_INTERVAL_MS 200U
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -198,16 +201,12 @@ static volatile uint32_t s_frame_dropped;
 static volatile uint32_t s_cksum_error;
 static volatile uint32_t s_len_error;
 static volatile uint32_t s_sof_skip;
-static uint32_t s_last_stats_tick;
-static uint32_t s_last_dropped_report;
-static uint32_t s_last_cksum_report;
-static uint32_t s_last_len_report;
-static uint32_t s_last_sof_report;
+static bool s_uart1_summary_dirty;
+static uint32_t s_last_uart1_summary_tick;
 static volatile bool s_uart2_rx_rearm_pending;
 static volatile uint32_t s_uart2_rx_rearm_fail_count;
 static volatile uint32_t s_uart2_rx_rearm_busy_count;
 static uint32_t s_uart2_rx_rearm_ok_count;
-static uint32_t s_last_uart2_rearm_log_tick;
 
 /* OLED 显示与最新生理参数缓存。 */
 static bool s_oled_ready;
@@ -262,15 +261,14 @@ static HAL_StatusTypeDef LD6002_RearmUart2Rx(void);
 static void LD6002_ServiceUart2RxRecovery(void);
 static uint32_t LD6002_U32Le(const uint8_t *buf);
 static float LD6002_F32Le(const uint8_t *buf);
-static void LD6002_FormatFloat(float value, char *out, size_t out_size);
 static void LD6002_UpdateHumanPresence(bool raw_human_present);
 static LD6002_RangeState LD6002_ClassifyRangeState(float raw_range_cm,
                                                     float filtered_range_cm,
                                                     LD6002_RangeState prev_state);
 static void LD6002_UpdateTargetRange(uint32_t flag, float range_cm);
 
-static void UART1_SendText(const char *text);
 static void UART1_Sendf(const char *fmt, ...);
+static void UART1_SendSummaryIfNeeded(void);
 static void LD6002_LogFrame(const LD6002_Frame *frame);
 static void LD6002_ProcessFrames(void);
 static void LD6002_ReportStats(void);
@@ -476,10 +474,7 @@ static bool LD6002_QueuePop(LD6002_Frame *frame)
 /* 启动 UART2 一字节中断接收。 */
 static void LD6002_StartUart2Rx(void)
 {
-  if (LD6002_RearmUart2Rx() != HAL_OK)
-  {
-    UART1_SendText("[RADAR] UART2 RX start pending retry\r\n");
-  }
+  (void)LD6002_RearmUart2Rx();
 }
 
 /*
@@ -509,8 +504,6 @@ static HAL_StatusTypeDef LD6002_RearmUart2Rx(void)
 /* 主循环中的 UART2 恢复服务：重试并做限频告警日志。 */
 static void LD6002_ServiceUart2RxRecovery(void)
 {
-  uint32_t now;
-
   if (!s_uart2_rx_rearm_pending)
   {
     return;
@@ -519,20 +512,6 @@ static void LD6002_ServiceUart2RxRecovery(void)
   if (LD6002_RearmUart2Rx() == HAL_OK)
   {
     s_uart2_rx_rearm_ok_count++;
-    UART1_Sendf("[RADAR][UART2] RX rearm recovered fail=%lu busy=%lu ok=%lu\r\n",
-                (unsigned long)s_uart2_rx_rearm_fail_count,
-                (unsigned long)s_uart2_rx_rearm_busy_count,
-                (unsigned long)s_uart2_rx_rearm_ok_count);
-    return;
-  }
-
-  now = HAL_GetTick();
-  if ((now - s_last_uart2_rearm_log_tick) >= 1000U)
-  {
-    s_last_uart2_rearm_log_tick = now;
-    UART1_Sendf("[RADAR][WARN] UART2 RX rearm pending fail=%lu busy=%lu\r\n",
-                (unsigned long)s_uart2_rx_rearm_fail_count,
-                (unsigned long)s_uart2_rx_rearm_busy_count);
   }
 }
 
@@ -552,24 +531,6 @@ static float LD6002_F32Le(const uint8_t *buf)
   float value;
   memcpy(&value, &raw, sizeof(value));
   return value;
-}
-
-/* 浮点格式化为固定 3 位小数，便于串口日志查看。 */
-static void LD6002_FormatFloat(float value, char *out, size_t out_size)
-{
-  int32_t scaled = (int32_t)(value * 1000.0f);
-  int32_t abs_scaled = (scaled < 0) ? -scaled : scaled;
-  int32_t integer = abs_scaled / 1000;
-  int32_t decimal = abs_scaled % 1000;
-
-  if (scaled < 0)
-  {
-    (void)snprintf(out, out_size, "-%ld.%03ld", (long)integer, (long)decimal);
-  }
-  else
-  {
-    (void)snprintf(out, out_size, "%ld.%03ld", (long)integer, (long)decimal);
-  }
 }
 
 /*
@@ -595,6 +556,7 @@ static void LD6002_UpdateHumanPresence(bool raw_human_present)
     if ((!s_human_detect_valid) || (s_human_present != raw_human_present))
     {
       s_oled_rate_dirty = true;
+      s_uart1_summary_dirty = true;
     }
 
     s_human_detect_valid = true;
@@ -678,6 +640,7 @@ static void LD6002_UpdateTargetRange(uint32_t flag, float range_cm)
       s_target_range_filtered_cm = 0.0f;
       s_range_state = LD6002_RANGE_UNKNOWN;
       s_oled_rate_dirty = true;
+      s_uart1_summary_dirty = true;
     }
 
     return;
@@ -707,11 +670,13 @@ static void LD6002_UpdateTargetRange(uint32_t flag, float range_cm)
   if ((!s_target_range_valid) || (next_state != prev_state))
   {
     s_oled_rate_dirty = true;
+    s_uart1_summary_dirty = true;
   }
 
   s_target_range_cm = range_cm;
   s_target_range_valid = true;
   s_range_state = next_state;
+  s_uart1_summary_dirty = true;
 }
 
 static uint8_t OLED_MapPhaseToY(float value, uint8_t center_y, float gain, uint8_t y_min, uint8_t y_max)
@@ -1011,6 +976,7 @@ static void OLED_SetBreathRate(float rate)
 {
   s_latest_breath_rate = rate;
   s_oled_rate_dirty = true;
+  s_uart1_summary_dirty = true;
 }
 
 /* 缓存最新心率并请求文本刷新。 */
@@ -1018,6 +984,7 @@ static void OLED_SetHeartRate(float rate)
 {
   s_latest_heart_rate = rate;
   s_oled_rate_dirty = true;
+  s_uart1_summary_dirty = true;
 }
 
 /* 缓存最新相位数据，由 OLED_Service 统一调度绘图。 */
@@ -1056,6 +1023,7 @@ static void OLED_Service(void)
     s_target_range_valid = false;
     s_range_state = LD6002_RANGE_UNKNOWN;
     s_oled_rate_dirty = true;
+    s_uart1_summary_dirty = true;
   }
 
   target_wave_mode = OLED_GetWaveMode();
@@ -1125,16 +1093,6 @@ static void OLED_UI_Init(void)
   OLED_UpdateVitalsText();
 }
 
-/* 向上位机发送纯文本日志。 */
-static void UART1_SendText(const char *text)
-{
-  size_t len = strlen(text);
-  if (len > 0U)
-  {
-    (void)HAL_UART_Transmit(&huart1, (uint8_t *)text, (uint16_t)len, LD6002_UART_TIMEOUT_MS);
-  }
-}
-
 /* 向上位机发送格式化日志。 */
 static void UART1_Sendf(const char *fmt, ...)
 {
@@ -1153,11 +1111,79 @@ static void UART1_Sendf(const char *fmt, ...)
   }
 }
 
+/*
+ * UART1 仅发送业务汇总：心率、呼吸、距离、人数。
+ * 通过 dirty 标记和时间节流，避免串口输出过于频繁。
+ */
+static void UART1_SendSummaryIfNeeded(void)
+{
+  uint32_t now;
+  int32_t br;
+  int32_t hr;
+  int32_t pos;
+  uint8_t people;
+
+  if (!s_uart1_summary_dirty)
+  {
+    return;
+  }
+
+  now = HAL_GetTick();
+  if ((now - s_last_uart1_summary_tick) < UART1_SUMMARY_INTERVAL_MS)
+  {
+    return;
+  }
+
+  br = (int32_t)(s_latest_breath_rate + ((s_latest_breath_rate >= 0.0f) ? 0.5f : -0.5f));
+  hr = (int32_t)(s_latest_heart_rate + ((s_latest_heart_rate >= 0.0f) ? 0.5f : -0.5f));
+  if (br < 0)
+  {
+    br = 0;
+  }
+
+  if (hr < 0)
+  {
+    hr = 0;
+  }
+
+  if (br > 999)
+  {
+    br = 999;
+  }
+
+  if (hr > 999)
+  {
+    hr = 999;
+  }
+
+  if (s_target_range_valid)
+  {
+    pos = (int32_t)(s_target_range_cm + ((s_target_range_cm >= 0.0f) ? 0.5f : -0.5f));
+    if (pos < 0)
+    {
+      pos = 0;
+    }
+  }
+  else
+  {
+    pos = 0;
+  }
+
+  people = (uint8_t)((s_human_detect_valid && s_human_present) ? 1U : 0U);
+
+  UART1_Sendf("[Rader]:心率：%ld  呼吸：%ld  位置：%ld  人数：%u\r\n",
+              (long)hr,
+              (long)br,
+              (long)pos,
+              (unsigned)people);
+
+  s_last_uart1_summary_tick = now;
+  s_uart1_summary_dirty = false;
+}
+
 /* 按帧类型分发业务逻辑：更新波形、数值和状态。 */
 static void LD6002_LogFrame(const LD6002_Frame *frame)
 {
-  char a[20];
-
   switch (frame->type)
   {
   case 0x0F09:
@@ -1167,8 +1193,6 @@ static void LD6002_LogFrame(const LD6002_Frame *frame)
       uint16_t is_human = (uint16_t)frame->data[0] | ((uint16_t)frame->data[1] << 8);
 
       LD6002_UpdateHumanPresence(is_human != 0U);
-
-      UART1_Sendf("[RADAR] TYPE=0x0F09 ID=0x%04X Human=%u\r\n", frame->id, (unsigned)is_human);
     }
     break;
 
@@ -1190,9 +1214,6 @@ static void LD6002_LogFrame(const LD6002_Frame *frame)
       float breath_rate = LD6002_F32Le(&frame->data[0]);
 
       OLED_SetBreathRate(breath_rate);
-
-      LD6002_FormatFloat(breath_rate, a, sizeof(a));
-      UART1_Sendf("[RADAR] TYPE=0x0A14 ID=0x%04X BreathRate=%s bpm\r\n", frame->id, a);
     }
     break;
 
@@ -1203,9 +1224,6 @@ static void LD6002_LogFrame(const LD6002_Frame *frame)
       float heart_rate = LD6002_F32Le(&frame->data[0]);
 
       OLED_SetHeartRate(heart_rate);
-
-      LD6002_FormatFloat(heart_rate, a, sizeof(a));
-      UART1_Sendf("[RADAR] TYPE=0x0A15 ID=0x%04X HeartRate=%s bpm\r\n", frame->id, a);
     }
     break;
 
@@ -1217,9 +1235,6 @@ static void LD6002_LogFrame(const LD6002_Frame *frame)
       float range = LD6002_F32Le(&frame->data[4]);
 
       LD6002_UpdateTargetRange(flag, range);
-
-      LD6002_FormatFloat(range, a, sizeof(a));
-      UART1_Sendf("[RADAR] TYPE=0x0A16 ID=0x%04X Flag=%lu Range=%s cm\r\n", frame->id, (unsigned long)flag, a);
     }
     break;
 
@@ -1250,31 +1265,7 @@ static void LD6002_ProcessFrames(void)
 /* 每秒输出一次变化后的统计计数。 */
 static void LD6002_ReportStats(void)
 {
-  uint32_t now = HAL_GetTick();
-
-  if ((now - s_last_stats_tick) < 1000U)
-  {
-    return;
-  }
-
-  s_last_stats_tick = now;
-
-  if ((s_frame_dropped != s_last_dropped_report) ||
-      (s_cksum_error != s_last_cksum_report) ||
-      (s_len_error != s_last_len_report) ||
-      (s_sof_skip != s_last_sof_report))
-  {
-    UART1_Sendf("[RADAR][STAT] drop=%lu cksum=%lu len=%lu sof_skip=%lu\r\n",
-                (unsigned long)s_frame_dropped,
-                (unsigned long)s_cksum_error,
-                (unsigned long)s_len_error,
-                (unsigned long)s_sof_skip);
-
-    s_last_dropped_report = s_frame_dropped;
-    s_last_cksum_report = s_cksum_error;
-    s_last_len_report = s_len_error;
-    s_last_sof_report = s_sof_skip;
-  }
+  UART1_SendSummaryIfNeeded();
 }
 
 /* USER CODE END 0 */
@@ -1315,8 +1306,6 @@ int main(void)
   LD6002_ParserReset(&s_ld6002_parser);
   OLED_UI_Init();
   LD6002_StartUart2Rx();
-  UART1_SendText("\r\n[RADAR] UART2->TF parser started\r\n");
-  UART1_SendText("[RADAR] OLED wave+vitals ready\r\n");
 
   /* USER CODE END 2 */
 
