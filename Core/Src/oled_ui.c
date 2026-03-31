@@ -4,6 +4,7 @@
 
 #include <stdio.h>
 
+/* OLED 右侧信息区显示模式。 */
 typedef enum
 {
   OLED_PANEL_VITALS = 0,
@@ -14,16 +15,19 @@ typedef enum
   OLED_PANEL_MODE_COUNT
 } OLED_RightPanelMode;
 
+/* 左侧波形显示模式。 */
 typedef enum
 {
   OLED_WAVE_MODE_NORMAL = 0,
   OLED_WAVE_MODE_AXES_ONLY
 } OLED_WaveMode;
 
+/* 左侧波形区几何范围（x=0..95）。 */
 #define OLED_WAVE_X_START 0U
 #define OLED_WAVE_X_END   95U
 #define OLED_WAVE_WIDTH   ((OLED_WAVE_X_END - OLED_WAVE_X_START) + 1U)
 
+/* 右侧信息区几何范围（x=96..127）。 */
 #define OLED_VALUE_AREA_X_START 96U
 #define OLED_VALUE_AREA_X_END   127U
 #define OLED_VALUE_AREA_WIDTH   ((OLED_VALUE_AREA_X_END - OLED_VALUE_AREA_X_START) + 1U)
@@ -31,13 +35,16 @@ typedef enum
 #define OLED_VALUE_LABEL_X OLED_VALUE_AREA_X_START
 #define OLED_VALUE_DATA_X  100U
 
+/* 英文提示居中时的 x 坐标辅助量。 */
 #define OLED_TEXT_2CHAR_X (OLED_VALUE_AREA_X_START + ((OLED_VALUE_AREA_WIDTH - 16U) / 2U))
 #define OLED_TEXT_3CHAR_X (OLED_VALUE_AREA_X_START + ((OLED_VALUE_AREA_WIDTH - 24U) / 2U))
 #define OLED_TEXT_4CHAR_X (OLED_VALUE_AREA_X_START + ((OLED_VALUE_AREA_WIDTH - 32U) / 2U))
 
+/* 8x16 字体对应页坐标。 */
 #define OLED_TEXT_LINE1_Y 5U
 #define OLED_TEXT_LINE2_Y 6U
 
+/* 中文字模索引（来源于 oledfont.h）。 */
 #define OLED_ZH_XIN 0U
 #define OLED_ZH_LV  1U
 #define OLED_ZH_HU  2U
@@ -47,25 +54,31 @@ typedef enum
 #define OLED_ZH_CUO 10U
 #define OLED_ZH_WU2 11U
 
+/* 呼吸波形区域与幅度映射参数。 */
 #define OLED_BREATH_Y_MIN    1U
 #define OLED_BREATH_Y_MAX    30U
 #define OLED_BREATH_CENTER_Y 15U
 #define OLED_BREATH_GAIN     22.0f
 
+/* 心率波形区域与幅度映射参数。 */
 #define OLED_HEART_Y_MIN    33U
 #define OLED_HEART_Y_MAX    62U
 #define OLED_HEART_CENTER_Y 47U
 #define OLED_HEART_GAIN     18.0f
 
+/* 上下波形分割虚线 y 坐标。 */
 #define OLED_WAVE_SPLIT_Y 31U
 
+/* OLED 刷新周期（ms）。 */
 #define OLED_WAVE_UPDATE_MS 50U
 #define OLED_TEXT_UPDATE_MS 200U
 
+/* 低值告警阈值与标签闪烁周期。 */
 #define OLED_BREATH_LOW_THRESHOLD 5.0f
 #define OLED_HEART_LOW_THRESHOLD 40.0f
 #define OLED_LOW_LABEL_BLINK_MS 500U
 
+/* OLED 内部运行状态。 */
 static bool s_oled_ready;
 static bool s_oled_wave_prev_valid;
 static uint8_t s_oled_wave_x;
@@ -92,6 +105,7 @@ static void OLED_DrawPanelMode(OLED_RightPanelMode mode, const RadarAppState *st
 static void OLED_PlotWaveColumn(float breath_phase, float heart_phase);
 static void OLED_UpdateVitalsText(const RadarAppState *state);
 
+/* 将相位值映射到指定 y 区间。 */
 static uint8_t OLED_MapPhaseToY(float value, uint8_t center_y, float gain, uint8_t y_min, uint8_t y_max)
 {
   int32_t y = (int32_t)center_y - (int32_t)(value * gain);
@@ -108,6 +122,7 @@ static uint8_t OLED_MapPhaseToY(float value, uint8_t center_y, float gain, uint8
   return (uint8_t)y;
 }
 
+/* Bresenham 直线绘制，用于连接相邻采样点。 */
 static void OLED_DrawLine(uint8_t x0, uint8_t y0, uint8_t x1, uint8_t y1)
 {
   int16_t dx = (int16_t)x1 - (int16_t)x0;
@@ -144,6 +159,7 @@ static void OLED_DrawLine(uint8_t x0, uint8_t y0, uint8_t x1, uint8_t y1)
   }
 }
 
+/* 绘制左侧波形区静态坐标轴。 */
 static void OLED_DrawWaveAxes(void)
 {
   uint8_t x;
@@ -160,6 +176,7 @@ static void OLED_DrawWaveAxes(void)
   }
 }
 
+/* 清空左侧波形区并保留坐标轴。 */
 static void OLED_ClearWaveAndKeepAxes(void)
 {
   uint8_t x;
@@ -177,6 +194,7 @@ static void OLED_ClearWaveAndKeepAxes(void)
   OLED_RefreshDirty();
 }
 
+/* 根据在线/人体/距离状态选择右侧显示模式。 */
 static OLED_RightPanelMode OLED_GetPanelMode(const RadarAppState *state)
 {
   if (!state->radar_data_online)
@@ -205,6 +223,7 @@ static OLED_RightPanelMode OLED_GetPanelMode(const RadarAppState *state)
   return OLED_PANEL_VITALS;
 }
 
+/* 根据右侧模式决定左侧波形绘制策略。 */
 static OLED_WaveMode OLED_GetWaveMode(const RadarAppState *state)
 {
   OLED_RightPanelMode panel_mode = OLED_GetPanelMode(state);
@@ -220,6 +239,7 @@ static OLED_WaveMode OLED_GetWaveMode(const RadarAppState *state)
   return OLED_WAVE_MODE_NORMAL;
 }
 
+/* 刷新“呼吸/心率”标签，低值时按闪烁状态显隐。 */
 static void OLED_UpdateVitalsLabels(const RadarAppState *state)
 {
   bool breath_low = (state->latest_breath_rate >= 0.0f) && (state->latest_breath_rate < OLED_BREATH_LOW_THRESHOLD);
@@ -262,6 +282,7 @@ static void OLED_UpdateVitalsLabels(const RadarAppState *state)
   s_oled_label_state_valid = true;
 }
 
+/* 重绘右侧信息区固定内容。 */
 static void OLED_DrawPanelMode(OLED_RightPanelMode mode, const RadarAppState *state)
 {
   OLED_Fill(OLED_VALUE_AREA_X_START, 0U, OLED_VALUE_AREA_X_END, 63U, 0U);
@@ -306,6 +327,7 @@ static void OLED_DrawPanelMode(OLED_RightPanelMode mode, const RadarAppState *st
   }
 }
 
+/* 绘制一列波形并推进滚动游标。 */
 static void OLED_PlotWaveColumn(float breath_phase, float heart_phase)
 {
   uint8_t x = (uint8_t)(OLED_WAVE_X_START + s_oled_wave_x);
@@ -363,6 +385,7 @@ static void OLED_PlotWaveColumn(float breath_phase, float heart_phase)
   OLED_RefreshDirty();
 }
 
+/* 刷新右侧文本（提示文案或数值）。 */
 static void OLED_UpdateVitalsText(const RadarAppState *state)
 {
   OLED_RightPanelMode panel_mode;
@@ -417,6 +440,7 @@ static void OLED_UpdateVitalsText(const RadarAppState *state)
   OLED_ShowString(OLED_VALUE_DATA_X, 6U, (u8 *)hr_text, 8U);
 }
 
+/* OLED 初始化：清屏、画轴并初始化运行状态。 */
 void OLED_UI_Init(RadarAppState *state)
 {
   OLED_Init();
@@ -451,6 +475,13 @@ void OLED_UI_Init(RadarAppState *state)
   }
 }
 
+/*
+ * OLED 周期服务：
+ * 1) 模式切换
+ * 2) 低值闪烁
+ * 3) 波形刷新
+ * 4) 文本刷新
+ */
 void OLED_UI_Service(RadarAppState *state)
 {
   uint32_t now;

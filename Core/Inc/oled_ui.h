@@ -7,7 +7,10 @@
 extern "C" {
 #endif
 
+/* 初始化 OLED UI：清屏、绘制坐标轴并重置显示状态。 */
 void OLED_UI_Init(RadarAppState *state);
+
+/* OLED 周期服务：刷新波形、文本与异常提示。 */
 void OLED_UI_Service(RadarAppState *state);
 
 #ifdef __cplusplus

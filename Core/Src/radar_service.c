@@ -2,6 +2,7 @@
 
 #include <string.h>
 
+/* LD6002 串口帧按字节解析状态机。 */
 typedef enum
 {
   LD6002_WAIT_SOF = 0,
@@ -16,6 +17,7 @@ typedef enum
   LD6002_DATA_CKSUM
 } LD6002_ParseState;
 
+/* 一帧解析完成后的数据容器。 */
 typedef struct
 {
   uint16_t id;
@@ -24,6 +26,7 @@ typedef struct
   uint8_t data[128];
 } LD6002_Frame;
 
+/* 解析上下文：保存状态机位置和临时缓冲。 */
 typedef struct
 {
   LD6002_ParseState state;
@@ -33,6 +36,7 @@ typedef struct
   LD6002_Frame frame;
 } LD6002_Parser;
 
+/* 协议基础参数。 */
 #define LD6002_SOF 0x01U
 #define LD6002_MAX_PAYLOAD_LEN 128U
 #define LD6002_FRAME_QUEUE_SIZE 16U
@@ -40,6 +44,7 @@ typedef struct
 #define LD6002_HUMAN_ENTER_CONFIRM_FRAMES 2U
 #define LD6002_HUMAN_LEAVE_CONFIRM_FRAMES 1U
 
+/* 距离阈值与滤波参数。 */
 #define LD6002_TARGET_RANGE_MIN_CM 35.0f
 #define LD6002_TARGET_RANGE_MAX_CM 100.0f
 #define LD6002_TARGET_RANGE_NEAR_RELEASE_CM 36.0f
@@ -48,9 +53,11 @@ typedef struct
 #define LD6002_TARGET_RANGE_FAR_FAST_RELEASE_CM 99.0f
 #define LD6002_RANGE_FILTER_ALPHA 0.75f
 
+/* 模块绑定的外设与共享状态。 */
 static UART_HandleTypeDef *s_uart2;
 static RadarAppState *s_state;
 
+/* UART2 接收解析链路状态。 */
 static uint8_t s_uart2_rx_byte;
 static LD6002_Parser s_ld6002_parser;
 static LD6002_Frame s_frame_queue[LD6002_FRAME_QUEUE_SIZE];
@@ -65,6 +72,7 @@ static volatile uint32_t s_uart2_rx_rearm_fail_count;
 static volatile uint32_t s_uart2_rx_rearm_busy_count;
 static uint32_t s_uart2_rx_rearm_ok_count;
 
+/* 有人状态去抖缓存。 */
 static bool s_human_candidate_present;
 static uint8_t s_human_candidate_count;
 
@@ -85,11 +93,13 @@ static LD6002_RangeState LD6002_ClassifyRangeState(float raw_range_cm,
 static void LD6002_UpdateTargetRange(uint32_t flag, float range_cm);
 static void LD6002_LogFrame(const LD6002_Frame *frame);
 
+/* 判断模块是否完成句柄与状态绑定。 */
 static bool Radar_IsReady(void)
 {
   return (s_uart2 != NULL) && (s_state != NULL);
 }
 
+/* 解析器复位：错误或一帧结束后都回到初态。 */
 static void LD6002_ParserReset(LD6002_Parser *parser)
 {
   parser->state = LD6002_WAIT_SOF;
@@ -100,6 +110,7 @@ static void LD6002_ParserReset(LD6002_Parser *parser)
   parser->frame.type = 0U;
 }
 
+/* 协议校验：逐字节异或后取反。 */
 static uint8_t LD6002_Checksum(const uint8_t *data, uint16_t len)
 {
   uint8_t cksum = 0U;
@@ -113,6 +124,10 @@ static uint8_t LD6002_Checksum(const uint8_t *data, uint16_t len)
   return (uint8_t)(~cksum);
 }
 
+/*
+ * 按字节推进解析状态机。
+ * 返回 true 表示 out_frame 得到一帧完整且校验通过的数据。
+ */
 static bool LD6002_ConsumeByte(LD6002_Parser *parser, uint8_t byte, LD6002_Frame *out_frame)
 {
   uint8_t expected_cksum;
@@ -229,6 +244,7 @@ static bool LD6002_ConsumeByte(LD6002_Parser *parser, uint8_t byte, LD6002_Frame
   return false;
 }
 
+/* ISR 中入队：队列满则丢帧并计数。 */
 static void LD6002_QueuePushFromISR(const LD6002_Frame *frame)
 {
   uint8_t next_head = (uint8_t)((s_frame_head + 1U) % LD6002_FRAME_QUEUE_SIZE);
@@ -243,6 +259,7 @@ static void LD6002_QueuePushFromISR(const LD6002_Frame *frame)
   s_frame_head = next_head;
 }
 
+/* 主循环出队：空队列返回 false。 */
 static bool LD6002_QueuePop(LD6002_Frame *frame)
 {
   if (s_frame_tail == s_frame_head)
@@ -255,11 +272,13 @@ static bool LD6002_QueuePop(LD6002_Frame *frame)
   return true;
 }
 
+/* 启动 UART2 单字节中断接收。 */
 static void LD6002_StartUart2Rx(void)
 {
   (void)LD6002_RearmUart2Rx();
 }
 
+/* 尝试重挂接 UART2 接收链路。 */
 static HAL_StatusTypeDef LD6002_RearmUart2Rx(void)
 {
   HAL_StatusTypeDef status;
@@ -287,6 +306,7 @@ static HAL_StatusTypeDef LD6002_RearmUart2Rx(void)
   return status;
 }
 
+/* 小端读取 uint32。 */
 static uint32_t LD6002_U32Le(const uint8_t *buf)
 {
   return ((uint32_t)buf[0]) |
@@ -295,6 +315,7 @@ static uint32_t LD6002_U32Le(const uint8_t *buf)
          ((uint32_t)buf[3] << 24);
 }
 
+/* 小端读取 IEEE754 float。 */
 static float LD6002_F32Le(const uint8_t *buf)
 {
   uint32_t raw = LD6002_U32Le(buf);
@@ -304,6 +325,7 @@ static float LD6002_F32Le(const uint8_t *buf)
   return value;
 }
 
+/* 有人状态去抖：进入/离开使用不同确认帧数。 */
 static void LD6002_UpdateHumanPresence(bool raw_human_present)
 {
   uint8_t required_frames = raw_human_present ? LD6002_HUMAN_ENTER_CONFIRM_FRAMES : LD6002_HUMAN_LEAVE_CONFIRM_FRAMES;
@@ -331,6 +353,11 @@ static void LD6002_UpdateHumanPresence(bool raw_human_present)
   }
 }
 
+/*
+ * 距离状态分类：
+ * 1) 原始值用于快速进入和快速释放；
+ * 2) 滤波值用于稳态判定，减少抖动。
+ */
 static LD6002_RangeState LD6002_ClassifyRangeState(float raw_range_cm,
                                                     float filtered_range_cm,
                                                     LD6002_RangeState prev_state)
@@ -378,6 +405,7 @@ static LD6002_RangeState LD6002_ClassifyRangeState(float raw_range_cm,
   }
 }
 
+/* 更新距离有效性、滤波值与分类状态。 */
 static void LD6002_UpdateTargetRange(uint32_t flag, float range_cm)
 {
   LD6002_RangeState prev_state;
@@ -429,6 +457,7 @@ static void LD6002_UpdateTargetRange(uint32_t flag, float range_cm)
   s_state->uart1_summary_dirty = true;
 }
 
+/* 按帧类型分发业务更新。 */
 static void LD6002_LogFrame(const LD6002_Frame *frame)
 {
   switch (frame->type)
@@ -486,6 +515,7 @@ static void LD6002_LogFrame(const LD6002_Frame *frame)
   }
 }
 
+/* 初始化共享状态默认值。 */
 void Radar_AppStateInit(RadarAppState *state)
 {
   if (state == NULL)
@@ -497,6 +527,7 @@ void Radar_AppStateInit(RadarAppState *state)
   state->range_state = LD6002_RANGE_UNKNOWN;
 }
 
+/* 初始化雷达接收模块并启动 UART2 中断接收。 */
 void Radar_Init(UART_HandleTypeDef *uart2, RadarAppState *state)
 {
   s_uart2 = uart2;
@@ -529,6 +560,7 @@ void Radar_Init(UART_HandleTypeDef *uart2, RadarAppState *state)
   LD6002_StartUart2Rx();
 }
 
+/* 主循环调用：持续尝试恢复 UART2 挂接失败。 */
 void Radar_ServiceUart2RxRecovery(void)
 {
   if (!s_uart2_rx_rearm_pending)
@@ -542,6 +574,7 @@ void Radar_ServiceUart2RxRecovery(void)
   }
 }
 
+/* 主循环调用：消费帧队列并更新共享状态。 */
 void Radar_ProcessFrames(void)
 {
   LD6002_Frame frame;
@@ -565,6 +598,7 @@ void Radar_ProcessFrames(void)
   }
 }
 
+/* 主循环调用：处理雷达离线超时回退。 */
 void Radar_ServiceOnlineTimeout(void)
 {
   uint32_t now;
@@ -594,6 +628,7 @@ void Radar_ServiceOnlineTimeout(void)
   }
 }
 
+/* HAL 串口接收完成回调转发入口。 */
 void Radar_UartRxCpltCallback(UART_HandleTypeDef *huart)
 {
   LD6002_Frame frame;
@@ -611,6 +646,7 @@ void Radar_UartRxCpltCallback(UART_HandleTypeDef *huart)
   (void)LD6002_RearmUart2Rx();
 }
 
+/* HAL 串口错误回调转发入口。 */
 void Radar_UartErrorCallback(UART_HandleTypeDef *huart)
 {
   if ((!Radar_IsReady()) || (huart == NULL) || (huart->Instance != s_uart2->Instance))

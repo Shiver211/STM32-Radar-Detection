@@ -2,11 +2,13 @@
 
 #include <stdbool.h>
 
+/* LED 闪烁状态机内部状态。 */
 static bool s_alert_led_inited;
 static bool s_alert_led_on;
 static bool s_alert_led_blink_active;
 static uint32_t s_last_alert_led_toggle_tick;
 
+/* 设置 LED 亮灭，自动适配高/低电平点亮。 */
 static void AlertLed_Set(bool on)
 {
   GPIO_PinState state;
@@ -24,6 +26,7 @@ static void AlertLed_Set(bool on)
   s_alert_led_on = on;
 }
 
+/* 判断当前是否应进入告警闪烁。 */
 static bool AlertLed_ShouldBlink(const RadarAppState *state)
 {
   bool no_data_alarm;
@@ -44,6 +47,7 @@ static bool AlertLed_ShouldBlink(const RadarAppState *state)
   return (no_data_alarm || no_human_alarm || range_alarm);
 }
 
+/* 初始化 LED 状态机并默认灭灯。 */
 void AlertLed_Init(void)
 {
   s_alert_led_blink_active = false;
@@ -52,6 +56,7 @@ void AlertLed_Init(void)
   AlertLed_Set(false);
 }
 
+/* 周期驱动 LED：异常闪烁，正常熄灭。 */
 void AlertLed_Service(const RadarAppState *state)
 {
   uint32_t now;
@@ -85,6 +90,7 @@ void AlertLed_Service(const RadarAppState *state)
 
   if ((now - s_last_alert_led_toggle_tick) >= ALERT_LED_BLINK_MS)
   {
+    /* 到达闪烁周期后翻转状态。 */
     s_last_alert_led_toggle_tick = now;
     AlertLed_Set(!s_alert_led_on);
   }
