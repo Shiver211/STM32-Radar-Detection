@@ -224,7 +224,7 @@ static bool s_alert_led_on;
 static bool s_alert_led_blink_active;
 static uint32_t s_last_alert_led_toggle_tick;
 
-/* OLED 显示与最新生理参数缓存。 */
+/* OLED 显示与最新参数缓存。 */
 static bool s_oled_ready;
 static bool s_oled_rate_dirty;
 static bool s_oled_wave_pending;
@@ -276,7 +276,7 @@ static uint8_t LD6002_Checksum(const uint8_t *data, uint16_t len);
 static bool LD6002_ConsumeByte(LD6002_Parser *parser, uint8_t byte, LD6002_Frame *out_frame);
 static void LD6002_QueuePushFromISR(const LD6002_Frame *frame);
 static bool LD6002_QueuePop(LD6002_Frame *frame);
-/* UART2 接收挂接：普通路径和错误恢复路径统一入口。 */
+/* UART2 接收：普通路径和错误恢复路径统一入口。 */
 static void LD6002_StartUart2Rx(void);
 static HAL_StatusTypeDef LD6002_RearmUart2Rx(void);
 static void LD6002_ServiceUart2RxRecovery(void);
@@ -671,7 +671,7 @@ static LD6002_RangeState LD6002_ClassifyRangeState(float raw_range_cm,
   switch (prev_state)
   {
   case LD6002_RANGE_TOO_NEAR:
-    if (raw_range_cm > LD6002_TARGET_RANGE_NEAR_FAST_RELEASE_CM)
+    if (raw_range_cm >= LD6002_TARGET_RANGE_NEAR_FAST_RELEASE_CM)
     {
       return LD6002_RANGE_NORMAL;
     }
@@ -679,7 +679,7 @@ static LD6002_RangeState LD6002_ClassifyRangeState(float raw_range_cm,
     return (filtered_range_cm < LD6002_TARGET_RANGE_NEAR_RELEASE_CM) ? LD6002_RANGE_TOO_NEAR : LD6002_RANGE_NORMAL;
 
   case LD6002_RANGE_TOO_FAR:
-    if (raw_range_cm < LD6002_TARGET_RANGE_FAR_FAST_RELEASE_CM)
+    if (raw_range_cm <= LD6002_TARGET_RANGE_FAR_FAST_RELEASE_CM)
     {
       return LD6002_RANGE_NORMAL;
     }
@@ -757,9 +757,9 @@ static void LD6002_UpdateTargetRange(uint32_t flag, float range_cm)
   s_uart1_summary_dirty = true;
 }
 
+/* 将相位值映射到屏幕 y 坐标，并限制在有效显示区间。 */
 static uint8_t OLED_MapPhaseToY(float value, uint8_t center_y, float gain, uint8_t y_min, uint8_t y_max)
 {
-  /* 将相位值映射到屏幕 y 坐标，并限制在有效显示区间。 */
   int32_t y = (int32_t)center_y - (int32_t)(value * gain);
 
   if (y < (int32_t)y_min)
@@ -828,7 +828,7 @@ static void OLED_DrawWaveAxes(void)
   }
 }
 
-/* 清空波形区并立即重绘坐标轴。 */
+/* 清空波形区并立即重绘坐标轴。 用于异常处理。*/
 static void OLED_ClearWaveAndKeepAxes(void)
 {
   uint8_t x;
