@@ -5,11 +5,14 @@
 
 /* 串口发送超时与发送节流周期。 */
 #define LD6002_UART_TIMEOUT_MS 50U
-#define UART1_SUMMARY_INTERVAL_MS 200U
+#define UART1_STREAM_INTERVAL_MS 50U
 
 /* UART1 模块上下文。 */
 static UART_HandleTypeDef *s_uart1;
-static uint32_t s_last_uart1_summary_tick;
+static uint32_t s_last_uart1_stream_tick;
+
+static void UART1_SendTelemetry(const RadarAppState *state, uint32_t now_tick);
+static int32_t UART1_RoundToInt(float value);
 
 /* 发送格式化文本到 UART1。 */
 static void UART1_Sendf(const char *fmt, ...)
@@ -34,88 +37,103 @@ static void UART1_Sendf(const char *fmt, ...)
   }
 }
 
+/* 将 float 四舍五入为 int32，避免依赖 printf 浮点格式化。 */
+static int32_t UART1_RoundToInt(float value)
+{
+  return (int32_t)(value + ((value >= 0.0f) ? 0.5f : -0.5f));
+}
+
+/* 输出结构化遥测数据，便于上位机稳定解析。 */
+static void UART1_SendTelemetry(const RadarAppState *state, uint32_t now_tick)
+{
+  float heart_rate;
+  float breath_rate;
+  float heart_phase;
+  float breath_phase;
+  float distance_cm;
+  int32_t heart_rate_out;
+  int32_t breath_rate_out;
+  int32_t heart_phase_out;
+  int32_t breath_phase_out;
+  int32_t distance_out;
+  uint8_t human_present;
+  uint8_t online;
+  uint8_t range_valid;
+
+  if (state == NULL)
+  {
+    return;
+  }
+
+  heart_rate = state->latest_heart_rate;
+  breath_rate = state->latest_breath_rate;
+  heart_phase = state->pending_heart_phase;
+  breath_phase = state->pending_breath_phase;
+  distance_cm = state->target_range_valid ? state->target_range_cm : 0.0f;
+
+  heart_rate_out = UART1_RoundToInt(heart_rate);
+  breath_rate_out = UART1_RoundToInt(breath_rate);
+  /* 相位放大 1000 倍后输出为整数，兼顾可读性与波形变化。 */
+  heart_phase_out = UART1_RoundToInt(heart_phase * 1000.0f);
+  breath_phase_out = UART1_RoundToInt(breath_phase * 1000.0f);
+  distance_out = UART1_RoundToInt(distance_cm);
+
+  if (heart_rate_out < 0)
+  {
+    heart_rate_out = 0;
+  }
+
+  if (breath_rate_out < 0)
+  {
+    breath_rate_out = 0;
+  }
+
+  if (distance_out < 0)
+  {
+    distance_out = 0;
+  }
+
+  human_present = (uint8_t)((state->human_detect_valid && state->human_present) ? 1U : 0U);
+  online = (uint8_t)(state->radar_data_online ? 1U : 0U);
+  range_valid = (uint8_t)(state->target_range_valid ? 1U : 0U);
+
+  UART1_Sendf("RADAR,%lu,%ld,%ld,%ld,%ld,%ld,%u,%u,%u,%u,%u\r\n",
+              (unsigned long)now_tick,
+              (long)heart_rate_out,
+              (long)breath_rate_out,
+              (long)heart_phase_out,
+              (long)breath_phase_out,
+              (long)distance_out,
+              (unsigned)human_present,
+              (unsigned)online,
+              (unsigned)range_valid,
+              1U,
+              1U);
+}
+
 /* 绑定 UART1 句柄并重置节流时间。 */
 void UART1_Summary_Init(UART_HandleTypeDef *uart1)
 {
   s_uart1 = uart1;
-  s_last_uart1_summary_tick = 0U;
+  s_last_uart1_stream_tick = 0U;
 }
 
-/* 周期发送业务汇总：心率、呼吸、距离、人数。 */
+/* 周期发送业务数据：固定周期主动上报。 */
 void UART1_Summary_Service(RadarAppState *state)
 {
   uint32_t now;
-  int32_t br;
-  int32_t hr;
-  int32_t pos;
-  uint8_t people;
 
   if ((state == NULL) || (s_uart1 == NULL))
   {
     return;
   }
 
-  /* 没有数据变更时不发送。 */
-  if (!state->uart1_summary_dirty)
-  {
-    return;
-  }
-
-  /* 节流窗口内跳过，避免串口占用过高。 */
   now = HAL_GetTick();
-  if ((now - s_last_uart1_summary_tick) < UART1_SUMMARY_INTERVAL_MS)
+  if ((now - s_last_uart1_stream_tick) < UART1_STREAM_INTERVAL_MS)
   {
     return;
   }
 
-  br = (int32_t)(state->latest_breath_rate + ((state->latest_breath_rate >= 0.0f) ? 0.5f : -0.5f));
-  hr = (int32_t)(state->latest_heart_rate + ((state->latest_heart_rate >= 0.0f) ? 0.5f : -0.5f));
-
-  /* 固定三位显示，限制在 0..999。 */
-  if (br < 0)
-  {
-    br = 0;
-  }
-
-  if (hr < 0)
-  {
-    hr = 0;
-  }
-
-  if (br > 999)
-  {
-    br = 999;
-  }
-
-  if (hr > 999)
-  {
-    hr = 999;
-  }
-
-  if (state->target_range_valid)
-  {
-    /* 距离有效时输出整数厘米值。 */
-    pos = (int32_t)(state->target_range_cm + ((state->target_range_cm >= 0.0f) ? 0.5f : -0.5f));
-    if (pos < 0)
-    {
-      pos = 0;
-    }
-  }
-  else
-  {
-    /* 距离无效时按 0 输出。 */
-    pos = 0;
-  }
-
-  /* 当前业务按 0/1 人输出。 */
-  people = (uint8_t)((state->human_detect_valid && state->human_present) ? 1U : 0U);
-
-  UART1_Sendf("[Rader]:心率：%ld  呼吸：%ld  位置：%ld  人数：%u\r\n",
-              (long)hr,
-              (long)br,
-              (long)pos,
-              (unsigned)people);
-
-  s_last_uart1_summary_tick = now;
-  state->uart1_summary_dirty = false;
+  UART1_SendTelemetry(state, now);
+  s_last_uart1_stream_tick = now;
 }

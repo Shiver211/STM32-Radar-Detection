@@ -2,3 +2,8 @@ build
 mx.scratch
 /.vscode
 /.settings
+application/radar_host/app/__pycache__/__init__.cpython-313.pyc
+application/radar_host/app/__pycache__/main_window.cpython-313.pyc
+application/radar_host/app/__pycache__/models.cpython-313.pyc
+application/radar_host/app/__pycache__/serial_client.cpython-313.pyc
+application/radar_host/app/__pycache__/storage.cpython-313.pyc
