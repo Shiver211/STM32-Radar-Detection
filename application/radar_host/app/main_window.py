@@ -1,3 +1,4 @@
+"""雷达上位机主窗口：包含串口控制、实时曲线、历史记录等界面。"""
 from __future__ import annotations
 
 import math
@@ -32,15 +33,18 @@ from .storage import MeasurementStorage
 
 
 class RadarMonitorWindow(QMainWindow):
+    """主窗口：整合串口通信、波形绘制、测量控制和历史记录查询。"""
+
     def __init__(self) -> None:
         super().__init__()
 
-        # 启用全局抗锯齿，降低折线边缘毛刺。
+        # 启用全局抗锯齿，让曲线更平滑
         pg.setConfigOptions(antialias=True)
 
         self.setWindowTitle("Radar 上位机监测平台")
         self.resize(1380, 860)
 
+        # 核心组件：串口客户端、数据库存储、两个测量会话（心率/呼吸）
         self._serial_client = SerialClient()
         project_root = Path(__file__).resolve().parents[1]
         self._storage = MeasurementStorage(project_root / "data" / "measurement_history.db")
@@ -48,8 +52,9 @@ class RadarMonitorWindow(QMainWindow):
         self._heart_session = MeasurementSession(measure_type="HEART")
         self._breath_session = MeasurementSession(measure_type="BREATH")
 
-        self._max_points = 600
-        self._scroll_window_points = 240
+        # 波形数据缓冲区
+        self._max_points = 600                # 最多保留 600 个采样点
+        self._scroll_window_points = 240      # 窗口内显示 240 个点
         self._x_values: list[float] = []
         self._heart_curve_values: list[float] = []
         self._breath_curve_values: list[float] = []
@@ -57,10 +62,11 @@ class RadarMonitorWindow(QMainWindow):
         self._breath_phase_curve_values: list[float] = []
         self._sample_index = 0
 
-        # 曲线平滑参数：alpha 越小越平滑，越大越跟手。
+        # 曲线平滑参数：alpha 越小越平滑，越大越跟手
         self._value_curve_smooth_alpha = 0.20
         self._phase_curve_smooth_alpha = 0.25
 
+        # 平滑前值缓存
         self._heart_value_smooth_prev: float | None = None
         self._breath_value_smooth_prev: float | None = None
         self._heart_phase_smooth_prev: float | None = None
@@ -69,19 +75,22 @@ class RadarMonitorWindow(QMainWindow):
         self._current_heart_avg_text = "--"
         self._current_breath_avg_text = "--"
 
-        # 串口调试计数器：用于快速定位“未收到/未解析/未绘制”。
-        self._debug_rx_count = 0
-        self._debug_ok_count = 0
-        self._debug_fail_count = 0
+        # 调试计数器
+        self._debug_rx_count = 0    # 收到的总行数
+        self._debug_ok_count = 0    # 解析成功数
+        self._debug_fail_count = 0  # 解析失败数
 
+        # 构建界面
         self._build_ui()
         self._apply_styles()
 
+        # 定时轮询串口数据（每 25ms 一次）
         self._serial_poll_timer = QTimer(self)
         self._serial_poll_timer.setInterval(25)
         self._serial_poll_timer.timeout.connect(self._poll_serial)
         self._serial_poll_timer.start()
 
+        # 定时扫描可用串口（每 1.5s 一次）
         self._port_scan_timer = QTimer(self)
         self._port_scan_timer.setInterval(1500)
         self._port_scan_timer.timeout.connect(self._refresh_ports_keep_selection)
@@ -89,11 +98,15 @@ class RadarMonitorWindow(QMainWindow):
 
         self._refresh_ports_keep_selection()
 
-    def closeEvent(self, event) -> None:  # type: ignore[override]
+    def closeEvent(self, event) -> None:
+        """窗口关闭时断开串口。"""
         self._serial_client.close()
         super().closeEvent(event)
 
+    # ───────────────────── 界面构建 ─────────────────────
+
     def _build_ui(self) -> None:
+        """搭建整体布局：左侧控制面板 + 右侧波形图 + 底部历史表格。"""
         central = QWidget(self)
         self.setCentralWidget(central)
 
@@ -101,6 +114,7 @@ class RadarMonitorWindow(QMainWindow):
         root.setContentsMargins(16, 14, 16, 16)
         root.setSpacing(12)
 
+        # 顶部标题栏
         title_layout = QHBoxLayout()
         self._title_label = QLabel("生理信号实时监测")
         self._subtitle_label = QLabel("Heart & Breath Monitor")
@@ -109,6 +123,7 @@ class RadarMonitorWindow(QMainWindow):
         title_layout.addWidget(self._subtitle_label)
         root.addLayout(title_layout)
 
+        # 主网格：左上控制面板，右上波形面板，下方历史面板
         main_grid = QGridLayout()
         main_grid.setHorizontalSpacing(12)
         main_grid.setVerticalSpacing(12)
@@ -127,11 +142,13 @@ class RadarMonitorWindow(QMainWindow):
         main_grid.setRowStretch(1, 0)
 
     def _build_control_panel(self) -> QGroupBox:
+        """左侧控制面板：串口选择、连接/断开、测量启停、调试日志。"""
         group = QGroupBox("设备与测量控制")
         layout = QVBoxLayout(group)
         layout.setContentsMargins(12, 16, 12, 12)
         layout.setSpacing(10)
 
+        # 串口选择
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignRight)
 
@@ -144,6 +161,7 @@ class RadarMonitorWindow(QMainWindow):
         form.addRow("波特率", self._baud_combo)
         layout.addLayout(form)
 
+        # 连接/断开按钮
         button_row = QHBoxLayout()
         self._refresh_btn = QPushButton("刷新串口")
         self._connect_btn = QPushButton("连接设备")
@@ -156,6 +174,7 @@ class RadarMonitorWindow(QMainWindow):
         self._status_label = QLabel("状态：未连接")
         layout.addWidget(self._status_label)
 
+        # 测量控制区
         measure_group = QGroupBox("独立测量控制")
         measure_layout = QGridLayout(measure_group)
 
@@ -176,6 +195,7 @@ class RadarMonitorWindow(QMainWindow):
 
         layout.addWidget(measure_group)
 
+        # 调试日志区
         debug_group = QGroupBox("串口调试")
         debug_layout = QVBoxLayout(debug_group)
 
@@ -206,6 +226,7 @@ class RadarMonitorWindow(QMainWindow):
         layout.addWidget(debug_group)
         layout.addStretch(1)
 
+        # 绑定按钮事件
         self._refresh_btn.clicked.connect(self._refresh_ports_keep_selection)
         self._connect_btn.clicked.connect(self._connect_serial)
         self._disconnect_btn.clicked.connect(self._disconnect_serial)
@@ -220,10 +241,12 @@ class RadarMonitorWindow(QMainWindow):
         return group
 
     def _build_plot_panel(self) -> QGroupBox:
+        """右侧波形面板：数值曲线和相位曲线两个页面可切换。"""
         group = QGroupBox("实时曲线")
         layout = QVBoxLayout(group)
         layout.setContentsMargins(10, 14, 10, 10)
 
+        # 页面切换按钮
         switch_row = QHBoxLayout()
         self._switch_value_page_btn = QPushButton("数值曲线页")
         self._switch_phase_page_btn = QPushButton("相位曲线页")
@@ -234,8 +257,10 @@ class RadarMonitorWindow(QMainWindow):
         switch_row.addStretch(1)
         layout.addLayout(switch_row)
 
+        # 两个页面用堆叠控件管理，同一时间只显示一个
         self._plot_stack = QStackedWidget()
 
+        # 数值曲线页
         self._value_plot_widget = pg.PlotWidget()
         self._value_plot_widget.setBackground((248, 248, 245))
         self._value_plot_widget.showGrid(x=True, y=True, alpha=0.25)
@@ -258,6 +283,7 @@ class RadarMonitorWindow(QMainWindow):
         value_layout.setContentsMargins(0, 0, 0, 0)
         value_layout.addWidget(self._value_plot_widget)
 
+        # 相位曲线页
         self._phase_plot_widget = pg.PlotWidget()
         self._phase_plot_widget.setBackground((248, 248, 245))
         self._phase_plot_widget.showGrid(x=True, y=True, alpha=0.25)
@@ -288,6 +314,7 @@ class RadarMonitorWindow(QMainWindow):
         self._switch_phase_page_btn.clicked.connect(self._show_phase_plot_page)
         self._show_value_plot_page()
 
+        # 底部实时数值显示
         info_row = QHBoxLayout()
         self._realtime_heart_label = QLabel("心率当前值：--")
         self._realtime_breath_label = QLabel("呼吸当前值：--")
@@ -301,10 +328,12 @@ class RadarMonitorWindow(QMainWindow):
         return group
 
     def _build_history_panel(self) -> QGroupBox:
+        """底部历史记录面板：按时间/类型查询已保存的测量记录。"""
         group = QGroupBox("历史记录查询")
         layout = QVBoxLayout(group)
         layout.setContentsMargins(10, 14, 10, 10)
 
+        # 查询条件栏
         filter_row = QHBoxLayout()
 
         now = QDateTime.currentDateTime()
@@ -331,6 +360,7 @@ class RadarMonitorWindow(QMainWindow):
 
         layout.addLayout(filter_row)
 
+        # 结果表格
         self._history_table = QTableWidget(0, 7)
         self._history_table.setHorizontalHeaderLabels(
             ["ID", "类型", "开始时间", "结束时间", "平均值", "样本数", "串口"]
@@ -347,6 +377,7 @@ class RadarMonitorWindow(QMainWindow):
         return group
 
     def _apply_styles(self) -> None:
+        """应用全局样式：配色、字体、圆角等。"""
         self.setStyleSheet(
             """
             QWidget {
@@ -423,7 +454,10 @@ class RadarMonitorWindow(QMainWindow):
         self._subtitle_label.setFont(sub_font)
         self._subtitle_label.setStyleSheet("color: #6f5a3f;")
 
+    # ───────────────────── 串口操作 ─────────────────────
+
     def _refresh_ports_keep_selection(self) -> None:
+        """刷新串口列表，尽量保持当前选中的端口不变。"""
         previous = self._port_combo.currentData()
         ports = self._serial_client.list_available_ports()
 
@@ -448,6 +482,7 @@ class RadarMonitorWindow(QMainWindow):
             self._status_label.setText(f"状态：发现 {len(ports)} 个串口设备")
 
     def _connect_serial(self) -> None:
+        """连接选中的串口。"""
         port = self._port_combo.currentData()
         if not port:
             QMessageBox.warning(self, "连接失败", "请选择可用串口")
@@ -455,7 +490,7 @@ class RadarMonitorWindow(QMainWindow):
 
         try:
             self._serial_client.open(port=str(port), baudrate=int(self._baud_combo.currentText()))
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             QMessageBox.critical(self, "连接失败", f"无法连接串口：{exc}")
             return
 
@@ -463,11 +498,15 @@ class RadarMonitorWindow(QMainWindow):
         self._append_debug_line(f"串口已连接：{self._serial_client.port_name} @ {self._baud_combo.currentText()}")
 
     def _disconnect_serial(self) -> None:
+        """断开串口连接。"""
         self._append_debug_line("串口断开")
         self._serial_client.close()
         self._status_label.setText("状态：未连接")
 
+    # ───────────────────── 测量控制 ─────────────────────
+
     def _start_heart_measurement(self) -> None:
+        """开始心率测量。"""
         if not self._serial_client.is_open:
             QMessageBox.warning(self, "提示", "请先连接串口设备")
             return
@@ -478,9 +517,11 @@ class RadarMonitorWindow(QMainWindow):
         self._status_label.setText("状态：心率测量中")
 
     def _stop_heart_measurement(self) -> None:
+        """停止心率测量并保存结果。"""
         self._finalize_measurement("HEART")
 
     def _start_breath_measurement(self) -> None:
+        """开始呼吸测量。"""
         if not self._serial_client.is_open:
             QMessageBox.warning(self, "提示", "请先连接串口设备")
             return
@@ -491,9 +532,11 @@ class RadarMonitorWindow(QMainWindow):
         self._status_label.setText("状态：呼吸测量中")
 
     def _stop_breath_measurement(self) -> None:
+        """停止呼吸测量并保存结果。"""
         self._finalize_measurement("BREATH")
 
     def _finalize_measurement(self, measure_type: str) -> None:
+        """结束一次测量：计算平均值、保存到数据库、更新界面。"""
         session = self._heart_session if measure_type == "HEART" else self._breath_session
         result = session.stop()
         if result is None:
@@ -512,6 +555,7 @@ class RadarMonitorWindow(QMainWindow):
             self._breath_value_smooth_prev = None
             self._breath_phase_smooth_prev = None
 
+        # 存入数据库
         self._storage.save_record(
             measure_type=result.measure_type,
             start_time=result.start_time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -525,7 +569,10 @@ class RadarMonitorWindow(QMainWindow):
             f"状态：{measure_type} 测量结束，平均值 {avg_text}，样本 {result.sample_count}"
         )
 
+    # ───────────────────── 数据接收与处理 ─────────────────────
+
     def _poll_serial(self) -> None:
+        """定时检查串口，读取新数据并逐行处理。"""
         if not self._serial_client.is_open:
             return
 
@@ -541,19 +588,21 @@ class RadarMonitorWindow(QMainWindow):
         self._update_debug_stats()
 
     def _process_line(self, line: str) -> None:
+        """解析一行数据，成功则更新波形和数值。"""
         frame = parse_telemetry_line(line)
         if frame is None:
             self._debug_fail_count += 1
             return
 
         self._debug_ok_count += 1
-
         self._apply_frame(frame)
 
     def _apply_frame(self, frame: TelemetryFrame) -> None:
+        """将一帧数据应用到曲线、标签和测量会话。"""
         heart_display_enabled = self._heart_session.active and frame.heart_enabled
         breath_display_enabled = self._breath_session.active and frame.breath_enabled
 
+        # 两个测量都没开，只显示距离
         if (not heart_display_enabled) and (not breath_display_enabled):
             self._heart_value_smooth_prev = None
             self._heart_phase_smooth_prev = None
@@ -565,6 +614,7 @@ class RadarMonitorWindow(QMainWindow):
             self._distance_label.setText(f"距离：{dist_text}")
             return
 
+        # 根据测量状态决定显示值（未开启的显示为空）
         if heart_display_enabled:
             heart_plot_value = max(frame.heart_rate, 0.0)
             heart_phase_plot_value = frame.heart_phase
@@ -583,6 +633,7 @@ class RadarMonitorWindow(QMainWindow):
             self._breath_value_smooth_prev = None
             self._breath_phase_smooth_prev = None
 
+        # 平滑处理：让曲线过渡更自然
         heart_plot_value, self._heart_value_smooth_prev = self._smooth_point(
             heart_plot_value,
             self._heart_value_smooth_prev,
@@ -599,11 +650,12 @@ class RadarMonitorWindow(QMainWindow):
             self._phase_curve_smooth_alpha,
         )
         breath_phase_plot_value, self._breath_phase_smooth_prev = self._smooth_point(
-            breath_phase_plot_value,
+            breath_plot_value,
             self._breath_phase_smooth_prev,
             self._phase_curve_smooth_alpha,
         )
 
+        # 追加到数据缓冲区
         self._sample_index += 1
         self._x_values.append(float(self._sample_index))
         self._heart_curve_values.append(heart_plot_value)
@@ -611,6 +663,7 @@ class RadarMonitorWindow(QMainWindow):
         self._heart_phase_curve_values.append(heart_phase_plot_value)
         self._breath_phase_curve_values.append(breath_phase_plot_value)
 
+        # 超出上限则丢弃最旧的数据
         if len(self._x_values) > self._max_points:
             self._x_values = self._x_values[-self._max_points :]
             self._heart_curve_values = self._heart_curve_values[-self._max_points :]
@@ -618,12 +671,14 @@ class RadarMonitorWindow(QMainWindow):
             self._heart_phase_curve_values = self._heart_phase_curve_values[-self._max_points :]
             self._breath_phase_curve_values = self._breath_phase_curve_values[-self._max_points :]
 
+        # 刷新四条曲线
         self._value_heart_curve.setData(self._x_values, self._heart_curve_values, connect="finite")
         self._value_breath_curve.setData(self._x_values, self._breath_curve_values, connect="finite")
         self._phase_heart_curve.setData(self._x_values, self._heart_phase_curve_values, connect="finite")
         self._phase_breath_curve.setData(self._x_values, self._breath_phase_curve_values, connect="finite")
         self._update_plot_ranges()
 
+        # 更新实时数值标签
         if heart_display_enabled:
             self._realtime_heart_label.setText(f"心率当前值：{frame.heart_rate:.2f}")
         else:
@@ -637,13 +692,17 @@ class RadarMonitorWindow(QMainWindow):
         dist_text = f"{frame.distance_cm:.2f} cm" if frame.range_valid else "无效"
         self._distance_label.setText(f"距离：{dist_text}")
 
+        # 采集样本到测量会话
         if heart_display_enabled and frame.heart_rate > 0:
             self._heart_session.add_sample(frame.heart_rate)
 
         if breath_display_enabled and frame.breath_rate > 0:
             self._breath_session.add_sample(frame.breath_rate)
 
+    # ───────────────────── 历史记录 ─────────────────────
+
     def _query_history(self) -> None:
+        """根据用户选择的时间范围和类型查询历史记录。"""
         start_dt = self._query_start_dt.dateTime().toPython()
         end_dt = self._query_end_dt.dateTime().toPython()
 
@@ -679,15 +738,20 @@ class RadarMonitorWindow(QMainWindow):
         self._status_label.setText(f"状态：查询到 {len(rows)} 条记录")
 
     def _force_stop_all_sessions(self) -> None:
+        """强制停止所有正在进行的测量。"""
         self._finalize_measurement("HEART")
         self._finalize_measurement("BREATH")
 
+    # ───────────────────── 辅助方法 ─────────────────────
+
     @staticmethod
     def _finite_values(values: list[float]) -> list[float]:
+        """过滤出有效的数值（排除空值）。"""
         return [v for v in values if math.isfinite(v)]
 
     @staticmethod
     def _smooth_point(raw_value: float, prev_value: float | None, alpha: float) -> tuple[float, float | None]:
+        """对单个数据点做平滑：新值 = alpha × 当前值 + (1-alpha) × 前值。"""
         if not math.isfinite(raw_value):
             return float("nan"), None
 
@@ -699,6 +763,7 @@ class RadarMonitorWindow(QMainWindow):
         return smoothed, smoothed
 
     def _update_plot_ranges(self) -> None:
+        """自动调整坐标轴的显示范围，让曲线始终在可视区域内。"""
         if not self._x_values:
             return
 
@@ -712,6 +777,7 @@ class RadarMonitorWindow(QMainWindow):
 
         begin = max(0, len(self._x_values) - self._scroll_window_points)
 
+        # 数值曲线 Y 轴
         value_visible = self._finite_values(self._heart_curve_values[begin:])
         value_visible.extend(self._finite_values(self._breath_curve_values[begin:]))
 
@@ -721,6 +787,7 @@ class RadarMonitorWindow(QMainWindow):
         else:
             self._value_plot_widget.setYRange(0.0, 10.0, padding=0.0)
 
+        # 相位曲线 Y 轴
         phase_visible = self._finite_values(self._heart_phase_curve_values[begin:])
         phase_visible.extend(self._finite_values(self._breath_phase_curve_values[begin:]))
 
@@ -736,29 +803,35 @@ class RadarMonitorWindow(QMainWindow):
             self._phase_plot_widget.setYRange(-1.0, 1.0, padding=0.0)
 
     def _show_value_plot_page(self) -> None:
+        """切换到数值曲线页。"""
         self._plot_stack.setCurrentIndex(0)
         self._switch_value_page_btn.setChecked(True)
         self._switch_phase_page_btn.setChecked(False)
 
     def _show_phase_plot_page(self) -> None:
+        """切换到相位曲线页。"""
         self._plot_stack.setCurrentIndex(1)
         self._switch_value_page_btn.setChecked(False)
         self._switch_phase_page_btn.setChecked(True)
 
     def _update_debug_stats(self) -> None:
+        """更新调试计数器的显示。"""
         self._debug_rx_label.setText(f"RX: {self._debug_rx_count}")
         self._debug_ok_label.setText(f"解析成功: {self._debug_ok_count}")
         self._debug_fail_label.setText(f"解析失败: {self._debug_fail_count}")
 
     def _append_debug_line(self, text: str) -> None:
+        """向日志窗口追加一行带时间戳的文本。"""
         ts = QDateTime.currentDateTime().toString("HH:mm:ss.zzz")
         self._debug_log.appendPlainText(f"[{ts}] {text}")
 
     def _clear_debug_log(self) -> None:
+        """清空调试日志。"""
         self._debug_log.clear()
         self._append_debug_line("日志已清空")
 
-    def keyPressEvent(self, event) -> None:  # type: ignore[override]
+    def keyPressEvent(self, event) -> None:
+        """按键事件：按 Esc 停止所有测量。"""
         if event.key() == Qt.Key_Escape:
             self._force_stop_all_sessions()
             self._status_label.setText("状态：已停止全部测量")
