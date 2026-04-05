@@ -1,6 +1,7 @@
 """雷达上位机主窗口：包含串口控制、实时曲线、历史记录等界面。"""
 from __future__ import annotations
 
+from datetime import datetime
 import math
 from pathlib import Path
 
@@ -9,13 +10,13 @@ from PySide6.QtCore import QDateTime, QTimer, Qt
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QComboBox,
-    QDateTimeEdit,
     QFormLayout,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -116,7 +117,7 @@ class RadarMonitorWindow(QMainWindow):
 
         # 顶部标题栏
         title_layout = QHBoxLayout()
-        self._title_label = QLabel("生理信号实时监测")
+        self._title_label = QLabel("信号监测")
         self._subtitle_label = QLabel("Heart & Breath Monitor")
         title_layout.addWidget(self._title_label)
         title_layout.addStretch(1)
@@ -175,7 +176,7 @@ class RadarMonitorWindow(QMainWindow):
         layout.addWidget(self._status_label)
 
         # 测量控制区
-        measure_group = QGroupBox("独立测量控制")
+        measure_group = QGroupBox("测量项目")
         measure_layout = QGridLayout(measure_group)
 
         self._heart_start_btn = QPushButton("开始心率测量")
@@ -196,7 +197,7 @@ class RadarMonitorWindow(QMainWindow):
         layout.addWidget(measure_group)
 
         # 调试日志区
-        debug_group = QGroupBox("串口调试")
+        debug_group = QGroupBox("调试日志")
         debug_layout = QVBoxLayout(debug_group)
 
         debug_stats_row = QHBoxLayout()
@@ -250,10 +251,12 @@ class RadarMonitorWindow(QMainWindow):
         switch_row = QHBoxLayout()
         self._switch_value_page_btn = QPushButton("数值曲线页")
         self._switch_phase_page_btn = QPushButton("相位曲线页")
+        self._clear_plot_btn = QPushButton("清空曲线")
         self._switch_value_page_btn.setCheckable(True)
         self._switch_phase_page_btn.setCheckable(True)
         switch_row.addWidget(self._switch_value_page_btn)
         switch_row.addWidget(self._switch_phase_page_btn)
+        switch_row.addWidget(self._clear_plot_btn)
         switch_row.addStretch(1)
         layout.addLayout(switch_row)
 
@@ -312,6 +315,7 @@ class RadarMonitorWindow(QMainWindow):
 
         self._switch_value_page_btn.clicked.connect(self._show_value_plot_page)
         self._switch_phase_page_btn.clicked.connect(self._show_phase_plot_page)
+        self._clear_plot_btn.clicked.connect(self._clear_plot_data)
         self._show_value_plot_page()
 
         # 底部实时数值显示
@@ -336,13 +340,11 @@ class RadarMonitorWindow(QMainWindow):
         # 查询条件栏
         filter_row = QHBoxLayout()
 
-        now = QDateTime.currentDateTime()
-        self._query_start_dt = QDateTimeEdit(now.addDays(-7))
-        self._query_end_dt = QDateTimeEdit(now)
-        self._query_start_dt.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
-        self._query_end_dt.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
-        self._query_start_dt.setCalendarPopup(True)
-        self._query_end_dt.setCalendarPopup(True)
+        now_dt = QDateTime.currentDateTime()
+        self._query_start_dt = QLineEdit(now_dt.addDays(-7).toString("yyyy-MM-dd"))
+        self._query_end_dt = QLineEdit(now_dt.toString("yyyy-MM-dd"))
+        self._query_start_dt.setPlaceholderText("yyyy-MM-dd")
+        self._query_end_dt.setPlaceholderText("yyyy-MM-dd")
 
         self._query_type_combo = QComboBox()
         self._query_type_combo.addItems(["ALL", "HEART", "BREATH"])
@@ -422,7 +424,7 @@ class RadarMonitorWindow(QMainWindow):
             QPushButton:pressed {
                 background-color: #946d23;
             }
-            QComboBox, QDateTimeEdit {
+            QComboBox, QLineEdit {
                 background-color: #ffffff;
                 border: 1px solid #cabba6;
                 border-radius: 8px;
@@ -650,7 +652,7 @@ class RadarMonitorWindow(QMainWindow):
             self._phase_curve_smooth_alpha,
         )
         breath_phase_plot_value, self._breath_phase_smooth_prev = self._smooth_point(
-            breath_plot_value,
+            breath_phase_plot_value,
             self._breath_phase_smooth_prev,
             self._phase_curve_smooth_alpha,
         )
@@ -703,17 +705,27 @@ class RadarMonitorWindow(QMainWindow):
 
     def _query_history(self) -> None:
         """根据用户选择的时间范围和类型查询历史记录。"""
-        start_dt = self._query_start_dt.dateTime().toPython()
-        end_dt = self._query_end_dt.dateTime().toPython()
+        start_text = self._query_start_dt.text().strip()
+        end_text = self._query_end_dt.text().strip()
 
-        if end_dt < start_dt:
+        try:
+            start_date = datetime.strptime(start_text, "%Y-%m-%d").date()
+            end_date = datetime.strptime(end_text, "%Y-%m-%d").date()
+        except ValueError:
+            QMessageBox.warning(self, "查询失败", "日期格式应为 yyyy-MM-dd")
+            return
+
+        if end_date < start_date:
             QMessageBox.warning(self, "查询失败", "结束时间不能早于起始时间")
             return
 
+        start_time_text = f"{start_date:%Y-%m-%d} 00:00:00"
+        end_time_text = f"{end_date:%Y-%m-%d} 23:59:59"
+
         measure_type = self._query_type_combo.currentText()
         rows = self._storage.query_records(
-            start_time=start_dt.strftime("%Y-%m-%d %H:%M:%S"),
-            end_time=end_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            start_time=start_time_text,
+            end_time=end_time_text,
             measure_type=measure_type,
         )
 
@@ -829,6 +841,35 @@ class RadarMonitorWindow(QMainWindow):
         """清空调试日志。"""
         self._debug_log.clear()
         self._append_debug_line("日志已清空")
+
+    def _clear_plot_data(self) -> None:
+        """清空所有曲线缓存，并把坐标轴恢复到初始显示范围。"""
+        self._x_values.clear()
+        self._heart_curve_values.clear()
+        self._breath_curve_values.clear()
+        self._heart_phase_curve_values.clear()
+        self._breath_phase_curve_values.clear()
+        self._sample_index = 0
+
+        self._heart_value_smooth_prev = None
+        self._breath_value_smooth_prev = None
+        self._heart_phase_smooth_prev = None
+        self._breath_phase_smooth_prev = None
+
+        self._value_heart_curve.setData([], [])
+        self._value_breath_curve.setData([], [])
+        self._phase_heart_curve.setData([], [])
+        self._phase_breath_curve.setData([], [])
+
+        self._value_plot_widget.setXRange(1.0, float(self._scroll_window_points), padding=0.0)
+        self._phase_plot_widget.setXRange(1.0, float(self._scroll_window_points), padding=0.0)
+        self._value_plot_widget.setYRange(0.0, 10.0, padding=0.0)
+        self._phase_plot_widget.setYRange(-1.0, 1.0, padding=0.0)
+
+        self._realtime_heart_label.setText("心率当前值：--")
+        self._realtime_breath_label.setText("呼吸当前值：--")
+        self._distance_label.setText("距离：--")
+        self._append_debug_line("曲线已清空")
 
     def keyPressEvent(self, event) -> None:
         """按键事件：按 Esc 停止所有测量。"""
