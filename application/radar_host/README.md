@@ -16,9 +16,6 @@
 - `app/storage.py`：SQLite 持久化
 - `app/models.py`：数据模型
 - `data/measurement_history.db`：运行后自动创建
-- `resources/images/`：UI 图片资源占位
-
-图片设计说明见：`resources/images/IMAGE_SPEC.md`
 
 ## 运行环境
 
@@ -37,7 +34,7 @@ pip install -r requirements.txt
 python main.py
 ```
 
-## 串口调试（推荐先做）
+## 串口调试
 
 如果界面看不到曲线，可先运行串口抓包工具：
 
